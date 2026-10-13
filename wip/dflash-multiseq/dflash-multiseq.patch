@@ -1,0 +1,252 @@
+From 25fd71e4bf104720baa29d6232b2392eab9fda92 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 01:09:49 +0800
+Subject: [PATCH 1/2] F1 for several sequences: the draft reads the target's
+ device rows through a row map
+
+With --parallel > 1 the DFlash F1 path (target features kept on the device) was off: a multi-sequence batch is split by
+split_equal, so the ubatch order can differ from the batch order, and output_reorder() puts only the host rows back.
+The target now keeps the inverse of embd_batch_idxs (llama_lf_get_dev_rows, nullptr when the order held, always for one
+sequence) and the draft maps each batch row to its device row.  Outputs are unchanged (the draft features are the same
+values); a 2-slot server's prefill gets the single-slot speed back (+22-24% on R9700).  The host rows are no longer
+permuted on the F1 path, where nothing reads them.
+
+Several sequences keep the host path when the target has host-resident MoE experts (-ncmoe/-cmoe): with the
+movable-boundary slab armed for them, the draft's device reads were observed to go wrong (Qwen3.6-35B-A3B, 3 slots,
+--n-cpu-moe 20: draft acceptance 0/1860 against 121/1279 on the host path; one sequence, or GGML_CUDA_SLAB=0, is fine).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp | 30 ++++++++++++++++++++++--------
+ src/llama-context.cpp  | 29 ++++++++++++++++++++++++++++-
+ src/llama-context.h    |  4 ++++
+ src/llama-ext.h        |  5 ++++-
+ 4 files changed, 58 insertions(+), 10 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index fc76acfa3..681576432 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -993,9 +993,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ 
+     std::vector<float> features_buf; // [n_chunk, n_embd_enc] gathered target features
+ 
+-    // Llama-Frankenstein F1 (single sequence; default on, GGML_LF_DFLASH_DEV=0 turns it off): the target keeps its extracted
+-    // layer inputs on the device and the injection batch carries the target rows as token ids, so the features never leave
+-    // the GPU. If the target cannot allocate its device buffers, it keeps the host path and so does the draft.
++    // Llama-Frankenstein F1 (default on, GGML_LF_DFLASH_DEV=0 turns it off): the target keeps its extracted layer inputs on
++    // the device and the injection batch carries the target rows as token ids, so the features never leave the GPU. Any
++    // number of sequences: the rows are positions in the target batch, the same offsets the host path reads, and each
++    // sequence is injected with its own seq_id. If the target cannot allocate its device buffers, it keeps the host path
++    // and so does the draft.
+     bool        lf_dev = false;
+     llama_batch batch_inject_tok = {};
+ 
+@@ -1132,7 +1134,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         {
+             const char * lf_env = getenv("GGML_LF_DFLASH_DEV");
+             const bool   lf_on  = lf_env == nullptr || atoi(lf_env) != 0;
+-            lf_dev = lf_on && n_seq == 1;
++            // several sequences keep the host path when the target has host-resident MoE experts (-ncmoe/-cmoe): the
++            // movable-boundary slab armed for them was observed to break the draft's device reads there (draft
++            // acceptance near 0 with two or more slots; one sequence, or GGML_CUDA_SLAB=0, is fine)
++            const bool host_experts = llama_model_moe_host_expert_dev_count(llama_get_model(ctx_tgt)) > 0;
++            lf_dev = lf_on && (n_seq == 1 || !host_experts);
++            if (lf_on && !lf_dev) {
++                LOG_WRN("%s: F1: %d sequences with host-resident MoE experts, using the host path\n", __func__, (int) n_seq);
++            }
+             if (lf_dev) {
+                 llama_lf_set_layer_inp_dev(ctx_tgt, true);
+                 batch_inject_tok = llama_batch_init(llama_n_ubatch(ctx_dft), 0, n_seq);
+@@ -1140,9 +1149,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                     free(batch_inject_tok.pos);
+                     batch_inject_tok.pos = (llama_pos *) malloc(sizeof(llama_pos) * 4 * llama_n_batch(ctx_dft));
+                 }
+-                LOG_INF("%s: F1: target features stay on the device (default on, GGML_LF_DFLASH_DEV=0 turns it off)\n", __func__);
+-            } else if (lf_env != nullptr && atoi(lf_env) != 0) {
+-                LOG_WRN("%s: F1 needs a single sequence (n_seq = %d), using the host path\n", __func__, (int) n_seq);
++                LOG_INF("%s: F1: target features stay on the device (n_seq = %d; default on, GGML_LF_DFLASH_DEV=0 turns it off)\n",
++                        __func__, (int) n_seq);
+             }
+         }
+ 
+@@ -1227,8 +1235,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         // stream, and the target must not overwrite them before the draft is done
+         // the target falls back to the host path when its device buffers could not be allocated
+         const bool use_dev = lf_dev && has_tokens && llama_lf_get_layer_inp_dev(ctx_tgt, (uint32_t) target_layer_ids[0]) != nullptr;
++        // with several sequences the target's ubatches may have reordered the batch: its device rows are then found
++        // through the row map (nullptr = same order, always the case for one sequence)
++        int32_t         lf_n_rows = 0;
++        const int32_t * lf_rows   = nullptr;
+         if (use_dev) {
+             llama_synchronize(ctx_tgt);
++            lf_rows = llama_lf_get_dev_rows(ctx_tgt, &lf_n_rows);
++            GGML_ASSERT(lf_rows == nullptr || lf_n_rows == n_tokens);
+         }
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+@@ -1244,7 +1258,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                     for (int32_t i = 0; i < n_chunk; ++i) {
+                         const int32_t   row = i_batch_beg[seq_id] + offset + i;
+                         const llama_pos p   = batch_in.tokens[row].pos[0];
+-                        batch_inject_tok.token[i] = row; // row of the target batch (see llama_lf_set_dev_inject)
++                        batch_inject_tok.token[i] = lf_rows ? lf_rows[row] : row; // device row (see llama_lf_set_dev_inject)
+                         batch_inject_tok.pos[i]   = p;
+                         if (is_mrope) {
+                             batch_inject_tok.pos[1 * n_chunk + i] = p;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 3f51c106a..3abe12624 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2396,6 +2396,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+ 
+     output_swaps.clear();
+     embd_batch_idxs.clear();
++    lf_dev_rows.clear();
+ 
+     sched_reserve();
+ 
+@@ -2685,6 +2686,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         }
+     } while (true);
+ 
++    // F1: the device buffers hold the rows in ubatch order; keep the inverse of embd_batch_idxs for the
++    // draft (output_reorder() permutes only the host buffers, and clears embd_batch_idxs when it runs)
++    if (cparams.lf_layer_inp_dev && !lf_layer_dev.empty()) {
++        bool same = true;
++        for (size_t d = 0; d < embd_batch_idxs.size() && same; ++d) {
++            same = embd_batch_idxs[d] == (int32_t) d;
++        }
++        if (!same) {
++            lf_dev_rows.assign(embd_batch_idxs.size(), -1);
++            for (size_t d = 0; d < embd_batch_idxs.size(); ++d) {
++                GGML_ASSERT(embd_batch_idxs[d] >= 0 && (size_t) embd_batch_idxs[d] < lf_dev_rows.size());
++                lf_dev_rows[embd_batch_idxs[d]] = (int32_t) d;
++            }
++        }
++    }
++
+     // set to total number of outputs in the batch, for use in llama_get_logits_ith
+     n_outputs = n_outputs_all;
+ 
+@@ -2915,6 +2932,11 @@ ggml_tensor * llama_context::get_lf_layer_inp_dev(uint32_t lid) const {
+     return lid < lf_layer_dev.size() ? lf_layer_dev[lid] : nullptr;
+ }
+ 
++const int32_t * llama_context::get_lf_dev_rows(int32_t * n_rows) const {
++    *n_rows = (int32_t) lf_dev_rows.size();
++    return lf_dev_rows.empty() ? nullptr : lf_dev_rows.data();
++}
++
+ void llama_context::set_lf_dev_inject(bool enable) {
+     cparams.lf_dev_inject = enable;
+ }
+@@ -3126,7 +3148,8 @@ void llama_context::output_reorder() {
+                 }
+             }
+             for (auto & layer : embd_layer_inp) {
+-                if (layer.has_data()) {
++                // F1 keeps the rows on the device (its own row map, see decode()); the host rows are unused there
++                if (layer.has_data() && !cparams.lf_layer_inp_dev) {
+                     for (size_t k = 0; k < n_embd; ++k) {
+                         std::swap(layer.data[i*n_embd + k], layer.data[j*n_embd + k]);
+                     }
+@@ -5092,6 +5115,10 @@ ggml_tensor * llama_lf_get_layer_inp_dev(llama_context * ctx, uint32_t lid) {
+     return ctx->get_lf_layer_inp_dev(lid);
+ }
+ 
++const int32_t * llama_lf_get_dev_rows(llama_context * ctx, int32_t * n_rows) {
++    return ctx->get_lf_dev_rows(n_rows);
++}
++
+ void llama_lf_set_dev_inject(llama_context * ctx, bool enable) {
+     ctx->set_lf_dev_inject(enable);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 0a1c265ba..2130cca62 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -252,6 +252,7 @@ public:
+     // Llama-Frankenstein F1: device-resident layer inputs (target) and device feature injection (draft)
+     void          set_lf_layer_inp_dev(bool enable);
+     ggml_tensor * get_lf_layer_inp_dev(uint32_t lid) const;
++    const int32_t * get_lf_dev_rows(int32_t * n_rows) const;
+     void          set_lf_dev_inject(bool enable);
+     // draft context: mark the target's device layer inputs as read (GPU-side event, no host wait)
+     void          lf_signal_features_consumed();
+@@ -265,6 +266,9 @@ private:
+     ggml_backend_buffer_ptr    lf_layer_buf;
+     ggml_backend_event_t       lf_consumed_ev      = nullptr;
+     bool                       lf_consumed_pending = false;
++    // F1 with several sequences: the ubatches may reorder the batch (split_equal), the device buffers keep the ubatch
++    // order (output_reorder() only fixes the host buffers): target batch row -> buffer row; empty when the order held
++    std::vector<int32_t>       lf_dev_rows;
+ 
+     //
+     // graph
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index cabf1e8b2..9ac8eff63 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -139,9 +139,12 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
+ // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
+ 
+-// Llama-Frankenstein F1: device-resident layer inputs for draft feature injection (single sequence)
++// Llama-Frankenstein F1: device-resident layer inputs for draft feature injection
+ LLAMA_API void                 llama_lf_set_layer_inp_dev(struct llama_context * ctx, bool enable);
+ LLAMA_API struct ggml_tensor * llama_lf_get_layer_inp_dev(struct llama_context * ctx, uint32_t lid);
++// target context: the device buffer row of each row of its last batch, or nullptr when they are the same (the ubatches
++// kept the batch order: always for one sequence); *n_rows = the batch size when not nullptr
++LLAMA_API const int32_t *      llama_lf_get_dev_rows     (struct llama_context * ctx, int32_t * n_rows);
+ // draft context: while enabled, a token batch is a KV injection whose token ids are the rows of the target's
+ // last batch (its ctx_other) to read from the device layer inputs
+ LLAMA_API void                 llama_lf_set_dev_inject   (struct llama_context * ctx, bool enable);
+-- 
+2.43.0
+
+
+From a296f6bad0487db6b0201c4f9c39db73c4a29525 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 03:00:00 +0800
+Subject: [PATCH 2/2] readback wait also for a ubatch without outputs when
+ per-token readbacks ran (DFlash layer inputs, unmasked nextn)
+
+GGML_READBACK_SYNC waited only when the ubatch had outputs.  The layer inputs are read back for every token, so a prompt
+chunk that does not end its prompt left them unordered against the next ubatch's input upload; on Windows the host copy of
+a layer input was observed holding an int32 input value of the next ubatch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 3abe12624..f236518f0 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2672,11 +2672,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         // and the host rows end up holding a later ubatch's data (multi-ubatch per-token outputs:
+         // perplexity / KLD, and the server's multi-sequence batches).  A single-ubatch decode has
+         // nothing to order against and pays nothing.
++        // The per-token readbacks (the DFlash layer inputs, the unmasked nextn embeddings) also run in a ubatch without
++        // outputs (a prompt chunk that does not end its prompt), so they need the same wait there: the next ubatch's input
++        // upload waits only for this graph's compute, not for the copies queued after it, and was observed (Windows, ROCm)
++        // to overwrite a layer input before its copy had read it.
+         static const bool readback_sync = getenv("GGML_READBACK_SYNC") == nullptr || atoi(getenv("GGML_READBACK_SYNC")) != 0;
+-        if (readback_sync && n_outputs > 0) {
++        if (readback_sync && (n_outputs > 0 || extract_all_idxs)) {
+             sync_readback(t_logits);
+             sync_readback(t_embd);
+             sync_readback(t_h_nextn);
++            for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
++                if (cparams.embeddings_layer_inp[il]) {
++                    sync_readback(res->get_layer_inp((int) il));
++                }
++            }
+             if (has_samplers) {
+                 for (ggml_tensor * t : res->t_sampled)        { sync_readback(t); }
+                 for (ggml_tensor * t : res->t_sampled_logits) { sync_readback(t); }
+-- 
+2.43.0
+
