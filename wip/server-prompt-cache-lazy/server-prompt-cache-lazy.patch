@@ -1,4 +1,4 @@
-From 6f20a5ae5cb582f982a8c94189a25e2f399dbe92 Mon Sep 17 00:00:00 2001
+From c21ebc82be4845db13dc63f9540f447940eee2c2 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
 Date: Fri, 23 Oct 2026 19:22:31 +0800
 Subject: [PATCH] server: keep idle slots resident with a unified KV cache,
@@ -16,7 +16,8 @@ whole state (330 MiB of recurrent state plus the KV of the context, 3.8 GB at 11
 - A restore can fail for want of KV cells held by another idle slot ("failed to find N available cells"); the slot then
   recomputed the whole prompt and the save that followed could evict the very entry that failed to load.  The restore now
   moves idle slots to the prompt cache one at a time, with the entry being restored held out of the eviction, and retries.
-  server_prompt_cache::find() is split out of load() for this.
+  The same hold covers the save of the slot a task takes over, which runs before the restore and could evict the entry
+  the task was about to restore.  server_prompt_cache::find() is split out of load() for this.
 - LLAMA_SERVER_CACHE_REUSE (on unless 0): buffers of restored or evicted states are kept for the next save (the smallest
   spare that fits), within the cache size limit together with the cached states.
 
@@ -24,17 +25,17 @@ Measured on r115 (production settings of the reporter, gfx1201) with two convers
 (every switch saves and restores): 17.1 -> 5.4 s outside prompt eval over eight requests; 200K with a second conversation
 that overflows the unified KV cache: the long one is restored (57 tokens evaluated) instead of recomputed (200K tokens,
 135 s).  No arithmetic changes, but a different cache history places KV in other cells, so a near-tie can resolve to
-another token (seen once: top-2 log-probs 0.08 apart), as a different request order already can.
+another token, as a different request order, or a restore instead of a recompute, already can.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- tools/server/server-context.cpp | 59 ++++++++++++++++++++++++++--
- tools/server/server-task.cpp    | 68 +++++++++++++++++++++++++++++----
- tools/server/server-task.h      | 11 ++++++
- 3 files changed, 127 insertions(+), 11 deletions(-)
+ tools/server/server-context.cpp | 71 +++++++++++++++++++++++++++++++--
+ tools/server/server-task.cpp    | 68 +++++++++++++++++++++++++++----
+ tools/server/server-task.h      | 11 +++++
+ 3 files changed, 139 insertions(+), 11 deletions(-)
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index b16e31467..f42543b21 100644
+index b16e31467..220324336 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1043,6 +1043,14 @@ private:
@@ -52,16 +53,30 @@ index b16e31467..f42543b21 100644
      server_metrics metrics;
  
      // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
-@@ -1810,7 +1818,7 @@ private:
+@@ -1808,9 +1816,21 @@ private:
  
+                 const int64_t t_start = ggml_time_us();
+ 
++                // the entry this task will restore is held out of the cache while the slot is saved, so the eviction
++                // that the save may cause cannot drop it
++                std::list<server_prompt_cache_state> held;
++                if (lazy_idle_slots) {
++                    auto it = prompt_cache->find(ret->prompt, task.tokens);
++                    if (it != prompt_cache->states.end()) {
++                        held.splice(held.begin(), prompt_cache->states, it);
++                    }
++                }
++
                  ret->prompt_save(*prompt_cache);
  
 -                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
++                prompt_cache->states.splice(prompt_cache->states.end(), held);
++
 +                if (!ret->prompt_load(*prompt_cache, task.tokens) && !prompt_load_with_room(*ret, task.tokens)) {
                      ret->prompt_clear();
                  }
  
-@@ -1823,18 +1831,63 @@ private:
+@@ -1823,18 +1843,63 @@ private:
          return ret;
      }
  
@@ -126,7 +141,7 @@ index b16e31467..f42543b21 100644
          for (auto & slot : slots) {
              if (slot.is_processing()) {
                  continue;
-@@ -2807,7 +2860,7 @@ private:
+@@ -2807,7 +2872,7 @@ private:
                          break; // drop the task
                      }
  
