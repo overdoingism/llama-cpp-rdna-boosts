@@ -1,0 +1,99 @@
+From cabddf8b86ca7755f06cb487a4442e65e9b314d5 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 12:59:36 +0800
+Subject: [PATCH] ggml-cuda: the decode/verify band skips fully masked KV
+ groups inside its round-robin split
+
+With a unified KV cache a sequence's attention covers every cell up to its last one, and the band (n_q <= 8) read all of
+them: a short conversation whose cells come after an idle slot's long context paid for those masked cells on every
+decode step.  The fully masked group skip (issue #48) was prefill only, to keep the band's round-robin KV split.  Since
+#210 (r130) keeps idle slots resident, this is the default case whenever a long conversation sits idle in front of an
+active one.
+
+The band now gets the packed group bitmap as well (flash_attn_mask_to_KV_blocks, per stream and query tile) and its loop,
+which already handled it, skips the masked iterations.  Block i still owns iterations i, i+P, i+2P, ...: it only leaves out
+the ones whose logits are all -INF, so its accumulation order over the rest is unchanged and the result is bit-identical.
+GGML_CUDA_FA_BAND_SKIP=0 turns it off.
+
+gfx1201, r131, Qwen3.8-27B UD-Q4_K_XL + DFlash2 n-max 5, -c 245760 --parallel 2 --kv-unified, q8_0 KV: with a ~100K
+context resident on the other slot, decode of an 8.6K-token request 57.44 -> 47.74 ms per step (-16.9 %), token ids
+identical.  test-backend-ops FLASH_ATTN_EXT (head 256, masked, q8_0 / f16 K/V): 292/292.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/fattn-common.cuh  | 18 ++++++++++++++++--
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh |  8 ++++++--
+ 2 files changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 83408dcdb..3d4019735 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -26,6 +26,18 @@ static inline bool ggml_cuda_fattn_kq_block_skip_enabled() {
+     return enabled;
+ }
+ 
++// The same skip in the decode/verify band (GGML_CUDA_FA_BAND_SKIP=0: off).  With a unified KV cache a short sequence whose
++// cells come after another slot's cells used to read all of those masked cells on every decode step.  The band keeps its
++// round-robin split: block i still owns the iterations i, i+P, ... and only skips the fully masked ones among them, so each
++// block's accumulation order over the remaining iterations is unchanged and the result stays bit-identical.
++static inline bool ggml_cuda_fattn_band_skip_enabled() {
++    static const bool enabled = []() {
++        const char * e = getenv("GGML_CUDA_FA_BAND_SKIP");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return enabled;
++}
++
+ // Runtime test of the group bitmap (either producer): true when the KV block starting at cell offset
+ // kb0*nbatch_fa is entirely masked for every query row the bitmap was classified against.  On the
+ // derived path the bitmap is batch-wide (one word run); on the packed path it is already offset to
+@@ -1823,9 +1835,11 @@ void launch_fattn(
+         ggml_cuda_fattn_kq_block_skip_enabled();
+     const bool kq_block_skip_derived =
+         kq_skip_ok && cell_pos != nullptr && tok_lo != nullptr && tok_hi != nullptr;
+-    // prefill only: the decode/verify band keeps its tuned round-robin KV split untouched
++    // the decode/verify band (n_q <= 8) keeps its round-robin KV split and skips only inside it (GGML_CUDA_FA_BAND_SKIP)
++    const bool band_skip = Q->ne[1] <= 8 && ncols2 == 8 && ggml_cuda_fattn_band_skip_enabled() &&
++        ggml_cuda_fattn_band_wmma_applies(cc, KQV);
+     const bool kq_block_skip_packed =
+-        kq_skip_ok && cell_pos == nullptr && mask != nullptr && Q->ne[1] > 8 &&
++        kq_skip_ok && cell_pos == nullptr && mask != nullptr && (Q->ne[1] > 8 || band_skip) &&
+         K->ne[1] % FATTN_KQ_STRIDE == 0;
+ 
+     const uint32_t * kq_blocks_arg = nullptr;
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index 20017230b..294f68779 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -2583,6 +2583,10 @@ static __global__ void flash_attn_ext_f16(
+             };
+             const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
+             const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
++            // packed fully-masked group bitmap of this (Q stream, query tile), when the launcher built one
++            // (GGML_CUDA_FA_BAND_SKIP): the round-robin split stays, the masked iterations in it are skipped
++            const uint32_t * kq_blocks_tile = kq_blocks != nullptr && mask != nullptr ?
++                kq_blocks + int64_t(sequence*iter_j + jt)*(((ne11/FATTN_KQ_STRIDE) + 31)/32) : nullptr;
+ 
+             const int kb0_start = blockIdx.y;
+             const int kb0_stop  = iter_k;
+@@ -2592,14 +2596,14 @@ static __global__ void flash_attn_ext_f16(
+                 constexpr bool needs_fixup = true;
+                 constexpr bool is_fixup    = false;
+                 flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, band_fetch_ahead>
+-                    (Q_f2, K_h2, V_h2, mask_h, nullptr, nullptr, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
++                    (Q_f2, K_h2, V_h2, mask_h, nullptr, kq_blocks_tile, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                      ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa,
+                      kb0_start, kb0_stop, derived, kv_native, kb0_step);
+             } else {
+                 constexpr bool needs_fixup = false;
+                 constexpr bool is_fixup    = true;
+                 flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, band_fetch_ahead>
+-                    (Q_f2, K_h2, V_h2, mask_h, nullptr, nullptr, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
++                    (Q_f2, K_h2, V_h2, mask_h, nullptr, kq_blocks_tile, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                      ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa,
+                      kb0_start, kb0_stop, derived, kv_native, kb0_step);
+             }
+-- 
+2.43.0
+
