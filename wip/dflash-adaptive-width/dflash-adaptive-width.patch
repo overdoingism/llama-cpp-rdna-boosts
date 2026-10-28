@@ -1,0 +1,313 @@
+From 7d461e44637906f1679afeb1f35f2e8c90d9c2b9 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 16:10:57 +0800
+Subject: [PATCH] speculative: DFlash2 adaptive verify width, aligned across
+ the sequences drafted together
+
+A DFlash2 sequence drafts w tokens; w follows running per-position acceptance estimates to the width with the most
+tokens per unit of step cost (cost model: 0.035 of a step per verified row, plus 0.08 of a 110K step from 5 rows, where
+the decode attention band leaves its 4-row tile; any width down, one up, at most once in 16 drafts, for a gain above
+1 %).  Every 4th draft carries one token past w so it can grow.  The output does not change: it is decided by the target.
+
+The estimates come from the sequence's history: at its next draft, the last draft is compared with the tokens the target
+produced after it (a draft token equal to the target's token at its position is one the verification accepts, under
+greedy match and under rejection sampling alike).  Nothing hooks accept() / accept_partial(), so a draft cut after
+draft() returns, a checkpoint replay or rounds drafted by another implementation do not skew the width.
+
+On a hybrid or recurrent target (spec_align_enabled(), issue #234), the sequences drafted in one call send one width,
+the widest among them, bounded by the lowest hard cap of the call (as align_draft_caps() does for draft-mtp-adaptive):
+without it, two slots at different widths split the verify batch into two ubatches.  No cut of finished drafts.
+
+LLAMA_DFLASH_ADAPTIVE=0 keeps the width fixed at --spec-draft-n-max (2 also logs the width changes);
+LLAMA_SPEC_ALIGN=0 drops the alignment; LLAMA_DFLASH_ADAPTIVE_COST / LLAMA_DFLASH_ADAPTIVE_JUMP override the cost model.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp | 214 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 213 insertions(+), 1 deletion(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 9355f2680..161a57c33 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -14,6 +14,7 @@
+ #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+ 
+ #include <algorithm>
++#include <numeric>
+ #include <cassert>
+ #include <cmath>
+ #include <cstring>
+@@ -1081,6 +1082,37 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+     // (A LLAMA_SWA_TYPE_CHUNKED window reaches back to the chunk start -- up to 2*n_swa-1 -- and would need a wider tail.)
+     int32_t                ingest_window = 0;
+     std::vector<llama_pos> ingest_from;
++    // adaptive verify width (DFlash2; on unless LLAMA_DFLASH_ADAPTIVE=0, 2 also logs the width changes): a sequence drafts
++    // w tokens and sends them to verification.  w follows running estimates of the acceptance at each position to the width
++    // with the most tokens per unit of step cost (down to any width, up one at a time, at most once in 16 drafts and
++    // for a gain above 1 %), so the target rebuilds its verify graph rarely.  Every 4th draft is one token longer than w;
++    // when the w tokens are accepted, the target's next token tells whether that one would have been, which is what lets
++    // w grow again.  The estimates come from the sequence's own history (adapt_review()), not from accept()
++    struct adapt_state {
++        int32_t                  w      = 0;  // tokens sent to verification
++        int32_t                  since  = 0;  // reviews since w last changed
++        int32_t                  step   = 0;  // drafts so far (every 4th drafts one token past w)
++        int32_t                  pos    = 0;  // position of the sequence's last draft (the context length the cost sees)
++        std::vector<llama_token> d;           // the last draft as drafted (with the token past the width it was sent at)
++        size_t                   at     = 0;  // prompt length when it was drafted (the target's next tokens follow there)
++        llama_token              last   = LLAMA_TOKEN_NULL; // that round's id_last (prompt[at] once the round is in)
++        int32_t                  n_sent = 0;  // its tokens sent to verification
++        std::vector<float>       h;           // running P(accepted | previous position accepted), per position
++        std::vector<int32_t>     hist;        // drafts per width sent over the request
++    };
++    bool                      adapt      = false;
++    // issue #234 for the adaptive width (spec_align_enabled(), on a hybrid or recurrent target only): the sequences drafted
++    // in one call send one width, the widest among them, so the verify batch is not split into ubatches by length
++    bool                      align      = false;
++    int                       adapt_log  = 0;
++    // one more verified position, as a fraction of a verification step (LLAMA_DFLASH_ADAPTIVE_COST; measured on gfx1201:
++    // about 0.035 below 5 rows)
++    float                     adapt_cost = 0.035f;
++    // the step's extra cost once the verify batch reaches 5 rows, as a fraction of a step at 110K positions (scaled with the
++    // context, at most twice): on gfx1201 the decode attention band switches from its 4- to its 8-row tile there, +3.9 ms of
++    // a 49 ms step at 110K and next to nothing at 8K (LLAMA_DFLASH_ADAPTIVE_JUMP; 0: no step)
++    float                     adapt_jump = 0.08f;
++    std::vector<adapt_state>  adapt_st;
+ 
+     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
+     uint32_t        target_layer_ids_n = 0;
+@@ -1146,6 +1178,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             ingest_from.assign(n_seq, 0);
+         }
+ 
++        {
++            const char * ad = getenv("LLAMA_DFLASH_ADAPTIVE"); // 0 = off, 1 = on (default), 2 = on and log the width changes
++            adapt_log = ad != nullptr ? atoi(ad) : 1;
++            adapt     = is_dflash2 && adapt_log > 0;
++            if (adapt && spec_align_enabled() && this->params.ctx_tgt != nullptr) {
++                const llama_model * model_tgt = llama_get_model(this->params.ctx_tgt);
++                align = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
++            }
++            const char * ac = getenv("LLAMA_DFLASH_ADAPTIVE_COST");
++            if (ac != nullptr && atof(ac) > 0.0) {
++                adapt_cost = (float) atof(ac);
++            }
++            const char * aj = getenv("LLAMA_DFLASH_ADAPTIVE_JUMP");
++            if (aj != nullptr) {
++                adapt_jump = std::max(0.0f, (float) atof(aj));
++            }
++        }
++
+         if (is_dspark && this->params.p_min > 0.0f) {
+             char buf[16] = {};
+             const bool has_conf =
+@@ -1176,6 +1226,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         }
+         this->n_max = this->params.n_max;
+ 
++        if (adapt) {
++            adapt_st.resize(n_seq);
++            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
++                adapt_reset(s);
++            }
++            LOG_INF("%s: - adaptive verify width 1..%d, start %d, cost of a verified position %.3f of a step, %.3f more from 5 rows at "
++                    "110K, %s (LLAMA_DFLASH_ADAPTIVE=0: fixed width)\n", __func__, this->params.n_max, adapt_st[0].w, adapt_cost, adapt_jump,
++                    align ? "sequences drafted together aligned to the widest" : "no alignment");
++        }
++
+         batch        = common_batch(ctx_dft);
+         batch_inject = common_batch(ctx_dft);
+ 
+@@ -1266,6 +1326,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         // reseed per request rather than per round, or two identical requests differ
+         dflash2_seed[seq_id] = -1;
+ 
++        if (adapt) {
++            const auto & st = adapt_st[seq_id];
++            if (adapt_log > 1 && st.since + std::accumulate(st.hist.begin(), st.hist.end(), 0) > 0) {
++                std::string h;
++                for (size_t w = 1; w < st.hist.size(); ++w) {
++                    h += string_format(" %zu:%d", w, st.hist[w]);
++                }
++                LOG_INF("%s: adaptive verify width seq %d, verifications per width:%s\n", __func__, (int) seq_id, h.c_str());
++            }
++            adapt_reset(seq_id);
++        }
++
+         const int32_t N = (int32_t) prompt.size();
+         if (N <= 0) {
+             return;
+@@ -1469,6 +1541,37 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         std::vector<int32_t> i_block_beg(n_seq, -1);
+         std::vector<int32_t> n_block    (n_seq,  0);
+ 
++        // with the adaptive width a sequence drafts its w tokens, and one more on every 4th draft so that draft token w+1
++        // can be checked against the target; the blocks of one batch have one length (the selector reads equal blocks),
++        // the longest asked for
++        int32_t n_draft = params.n_max;
++        // the width a sequence sends: its own w, or, when several sequences draft together and `align` is set, the widest w
++        // among them (raising a narrow sequence costs a few verify rows; a split costs a second pass over the weights),
++        // either one bounded by the hard caps of the call (--spec-draft-n-max and the caller's per-sequence n_max, which
++        // the server lowers as a response runs out of tokens; the lowest one for the aligned width, as align_draft_caps())
++        int32_t w_align = 0;
++        if (adapt) {
++            n_draft = 1;
++            int32_t n_together = 0;
++            int32_t n_hard_lo  = params.n_max;
++            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                const auto & dp = dparams[seq_id];
++                if (!dp.drafting) {
++                    continue;
++                }
++                adapt_review(seq_id, dp);
++                auto & st = adapt_st[seq_id];
++                const bool probe = st.step++ % 4 == 0;
++                n_draft = std::max(n_draft, std::min(params.n_max, st.w + (probe ? 1 : 0)));
++                n_together++;
++                w_align = std::max(w_align, st.w);
++                if (dp.n_max > 0) {
++                    n_hard_lo = std::min(n_hard_lo, dp.n_max);
++                }
++            }
++            w_align = align && n_together > 1 ? std::min(w_align, n_hard_lo) : 0;
++        }
++
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             auto & dp = dparams[seq_id];
+             if (!dp.drafting) {
+@@ -1478,8 +1581,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             common_sampler_reset(smpls[seq_id].get());
+ 
+             const int32_t n = (int32_t) dp.pos0;
++            if (adapt) {
++                adapt_st[seq_id].pos = n;
++            }
+ 
+-            const int32_t n_draft = params.n_max;
+             const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+             i_block_beg[seq_id] = batch.size();
+             n_block    [seq_id] = n_block_tokens;
+@@ -1588,6 +1693,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                     result.push_back((llama_token) row[predecessor]);
+                 }
+ 
++                if (adapt) {
++                    auto & st = adapt_st[seq_id];
++                    const int32_t w = w_align > 0 ? w_align : (dp.n_max > 0 ? std::min(st.w, dp.n_max) : st.w);
++                    if (dp.prompt != nullptr) {
++                        st.d.assign(result.begin(), result.begin() + std::min<size_t>(result.size(), w + 1));
++                        st.at   = dp.prompt->size();
++                        st.last = dp.id_last;
++                    }
++                    if ((int32_t) result.size() > w) {
++                        result.resize(w);
++                        if (sample) {
++                            dp.result_q->resize(w);
++                        }
++                    }
++                    st.n_sent = (int32_t) result.size();
++                }
++
+                 if (result.size() < (size_t) params.n_min) {
+                     result.clear();
+                     if (sample) {
+@@ -1656,6 +1778,96 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         }
+     }
+ 
++    void adapt_reset(llama_seq_id seq_id) {
++        auto & st = adapt_st[seq_id];
++        st = adapt_state();
++        const int32_t n_max = std::max(1, params.n_max);
++        st.w = params.n_start > 0 ? std::min(params.n_start, n_max) : n_max;
++        st.h.assign(n_max, 0.7f);
++        st.hist.assign(n_max + 1, 0);
++    }
++
++    static void adapt_observe(adapt_state & st, int32_t k, bool hit) {
++        if (k < (int32_t) st.h.size()) {
++            st.h[k] += ((hit ? 1.0f : 0.0f) - st.h[k]) / 32.0f;
++        }
++    }
++
++    // expected tokens per unit of step cost when w drafted tokens are verified
++    float adapt_value(const adapt_state & st, int32_t w) const {
++        float p = 1.0f;
++        float e = 1.0f;
++        for (int32_t k = 0; k < w; ++k) {
++            p *= st.h[k];
++            e += p;
++        }
++        const float jump = w + 1 >= 5 ? adapt_jump * std::min(2.0f, (float) st.pos / 110000.0f) : 0.0f;
++        return e / (1.0f + adapt_cost * (w + 1) + jump);
++    }
++
++    // the last draft of `seq_id` against what the target produced after it.  Since that draft the prompt has grown by
++    // that round's id_last and the tokens the target kept, and dp.id_last is the target's token after them.  A draft token
++    // equal to the target's token at its position is one the verification accepts (greedy match; under rejection sampling
++    // a rejected token is never the replacement), so the estimates need neither accept() nor the length the draft was
++    // verified at: a draft cut after draft() returned, a round replayed from a checkpoint, or rounds drafted by another
++    // implementation in between leave the same history
++    void adapt_review(llama_seq_id seq_id, const common_speculative_draft_params & dp) {
++        auto & st = adapt_st[seq_id];
++        if (st.d.empty() || dp.prompt == nullptr) {
++            return;
++        }
++        const std::vector<llama_token> d = std::move(st.d);
++        st.d.clear();
++        const llama_tokens & prompt = *dp.prompt;
++        if (prompt.size() <= st.at || prompt[st.at] != st.last) {
++            return; // the sequence was rewound or holds another request
++        }
++        for (int32_t k = 0; k < (int32_t) d.size(); ++k) {
++            const size_t i = st.at + 1 + k;
++            if (i > prompt.size()) {
++                break; // the target has not produced this position yet
++            }
++            const bool hit = d[k] == (i < prompt.size() ? prompt[i] : dp.id_last);
++            adapt_observe(st, k, hit);
++            if (!hit) {
++                break;
++            }
++        }
++        if (st.n_sent > 0) {
++            st.hist[std::min<size_t>(st.n_sent, st.hist.size() - 1)]++;
++        }
++
++        if (++st.since < 16) {
++            return;
++        }
++        // every position up to w+1 has fresh estimates: any shorter width, or one longer
++        int32_t best = st.w;
++        const float v_cur = adapt_value(st, st.w);
++        float       v_best = v_cur;
++        for (int32_t c = 1; c <= std::min<int32_t>(st.w + 1, st.h.size()); ++c) {
++            const float v = adapt_value(st, c);
++            if (v > v_best) {
++                best   = c;
++                v_best = v;
++            }
++        }
++        if (v_best < 1.01f * v_cur) {
++            best = st.w;
++        }
++        if (best != st.w) {
++            if (adapt_log > 1) {
++                std::string h;
++                for (const float v : st.h) {
++                    h += string_format(" %.2f", v);
++                }
++                LOG_INF("%s: adaptive verify width seq %d: %d -> %d (acceptance per position:%s)\n", __func__,
++                        (int) seq_id, st.w, best, h.c_str());
++            }
++            st.w     = best;
++            st.since = 0;
++        }
++    }
++
+     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+         // noop
+     }
+-- 
+2.43.0
+
