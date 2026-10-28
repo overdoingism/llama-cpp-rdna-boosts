@@ -1,0 +1,100 @@
+From 45ba22ea3d11b3dac0db713d0ca55c4c80cebd14 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 05:40:20 +0800
+Subject: [PATCH] llama: backend sampling: reserve once per sequence, not on
+ every set_sampler()
+
+llama_context::set_sampler() asked for a reserve whenever a backend sampler was set or removed, and the server sets a
+new chain for every request (and removes it for a grammar request).  sched_reserve() re-creates the scheduler, so every
+request freed and allocated all compute buffers again at the same size before its first token.  The behaviour is
+llama.cpp's own (src/llama-context.cpp, unchanged on ggml-org master as of 2026-10-29).
+
+Now a reserve is asked for only when the compute buffers were not reserved with a backend sampler for that sequence.
+A chain set again or removed needs none: the graph is rebuilt anyway (the samplers are part of the reuse check), the
+output buffers are sized per decode, and the graph allocator grows a buffer on demand if a chain ever needs more.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp | 22 +++++++++++++++-------
+ src/llama-context.h   |  4 ++++
+ 2 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index d5a66a499..833099a87 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -848,6 +848,12 @@ void llama_context::sched_reserve() {
+         }
+     }
+ 
++    // the buffers now cover a backend sampler for these sequences (see set_sampler)
++    sampling.reserved.clear();
++    for (const auto & entry : sampling.samplers) {
++        sampling.reserved.insert(entry.first);
++    }
++
+     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+         ggml_backend_t             backend = backend_ptrs[i];
+         ggml_backend_buffer_type_t buft    = backend_buft[i];
+@@ -1438,7 +1444,13 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+ 
+         sampling.samplers[seq_id] = sampler;
+ 
+-        sched_need_reserve = true;
++        // A reserve re-creates the scheduler, which frees and allocates every compute buffer again, so ask for one only
++        // when the buffers were not reserved with a backend sampler for this sequence.  A chain set again (the server sets
++        // a new one for every request) or removed needs none: the graph is rebuilt anyway (its samplers are part of the
++        // reuse check), and the allocator grows a buffer if a chain ever needs more.
++        if (sampling.reserved.count(seq_id) == 0) {
++            sched_need_reserve = true;
++        }
+ 
+         return true;
+     }
+@@ -1446,19 +1458,15 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+     if (sampler && !can_offload) {
+         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
+ 
+-        if (sampling.samplers.count(seq_id) > 0) {
+-            sched_need_reserve = true;
+-        }
+-
++        // no reserve: the buffers reserved with the sampler are large enough without it
+         sampling.samplers.erase(seq_id);
+ 
+         return false;
+     }
+ 
++    // no reserve: the buffers reserved with the sampler are large enough without it
+     sampling.samplers.erase(seq_id);
+ 
+-    sched_need_reserve = true;
+-
+     return true;
+ }
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 6938fb103..38439ba7e 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -14,6 +14,7 @@
+ 
+ #include <array>
+ #include <map>
++#include <set>
+ #include <vector>
+ 
+ struct llama_model;
+@@ -330,6 +331,9 @@ private:
+         // !samplers.empty() to check if any samplers are active
+         std::map<llama_seq_id, llama_sampler *> samplers;
+ 
++        // the sequences that had a backend sampler when the compute buffers were last reserved
++        std::set<llama_seq_id> reserved;
++
+         buffer_view<float>       logits     = {nullptr, 0};
+         buffer_view<llama_token> sampled    = {nullptr, 0};
+         buffer_view<float>       probs      = {nullptr, 0};
+-- 
+2.43.0
+
