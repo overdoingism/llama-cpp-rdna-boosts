@@ -5,7 +5,8 @@ One `git am` file (one commit), made on `v15-6050b467c-r164` (applied tree `6708
 `common/speculative.cpp` (+235 / -1), inside the DFlash drafter.
 `dflash-adaptive-width.patch` sha256 `911ff798617356feb5104f4f3905bf8524b23fac9d901c3e394b75e6ac5dffe7`.
 
-**This is v3**, after the review of v2:
+**This is v3**, after the review of v2 (v2 is the version first submitted in this PR; v1 was an internal draft that was
+never submitted):
 
 * **Opt-in.**  `LLAMA_DFLASH_ADAPTIVE=1` turns it on (`2` also logs the width changes and, per request, the verifications
   per width).  Unset or `0` runs the release's code path.
