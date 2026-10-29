@@ -31,7 +31,7 @@ measurements said 7.  v5 replaces the constant with the measured step time.
    a move and the measurement at the new width decides whether it stays: a move whose saving falls short is undone at the
    next decision.  Widths are compared by their own measured times, so no slope has to be fitted from a sequence that
    stays at one width (the reason we had first held back from this).
-5. **Not done: warm-up self-calibration.**  With 4 in place, the model's error costs at most one window at a wrong width.
+5. **Not done: warm-up self-calibration.**  With 4 in place, the model's error costs at most one window at each width it tries.
 
 `FLOOR`: on gfx1201 a step at width 1-2 was no cheaper than one at width 3 (Qwen3.8-27B + DFlash2 at 30K: 46 ms against
 44 ms), so the model costs fewer than 4 rows as 4 and the width does not go below 3 on the model's word.
@@ -70,9 +70,9 @@ Ryzen 9 3900X, one R9700 (gfx1201, PCIe 4.0 x16), Ubuntu 24.04.5, ROCm 10.0.0 (T
 + this patch.  Qwen3.8-27B-UD-Q4_K_XL + Qwen3.8-27B-DFlash2-Q4_K_M, `-c 98304 -ub 2048 -b 2048 -fa on -ctk q8_0 -ctv q8_0
 --kv-unified --parallel 2 --jinja`.  Two runs: R v5 R v5, then R v5 v2 v5 v2 R.
 
-*Config A*, `--spec-type draft-dflash --spec-draft-n-max 7`, greedy.  Slot 0: a Thai continuation, then an 8K-token English
-continuation (raw `/completion`, 256 tokens each).  Slot 1: rewriting a whole 1K-token Python file with a comment above
-each function (chat, thinking off, 1024 tokens).
+*Config A*, `--spec-type draft-dflash --spec-draft-n-max 7`, greedy.  Slot 0: a 2.8K-token Thai continuation, then an 8K-token
+English continuation (raw `/completion`, 256 tokens each).  Slot 1: rewriting a whole 3K-token Python file with a comment
+above each function (chat, thinking off, 1024 tokens).
 
 *Config B*, our production chain: `--spec-type ngram-mod,draft-dflash --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-min 8
 --spec-draft-n-max 5 --spec-draft-sampling probabilistic`.  Slot 0: one Chinese short-story prompt (chat, thinking on,
@@ -98,12 +98,13 @@ back up once the measured times said so.
 Ryzen 7 5700G, one R9700, Windows, TheRock ROCm 10.0.0, plain `v15-6050b467c-r171` + this patch.  `-ub 2048 -b 2048 -fa on
 -ctk q8_0 -ctv q8_0 --kv-unified --parallel 2 --jinja`, `/v1/chat/completions`.  Arms R v5 v2 v5 R v2 per block.
 
-* **qA**: Qwen3.8-27B-Uncensored-Q5_K_M (a fine-tune of Qwen3.8-27B) + Qwen3.8-27B-DFlash2-Q4_K_M, `-c 65536 --spec-type
+* **qA**: Qwen3.8-27B-Uncensored-Q5_K_M (an uncensored variant of Qwen3.8-27B) + Qwen3.8-27B-DFlash2-Q4_K_M, `-c 65536 --spec-type
   draft-dflash --spec-draft-n-max 7`, greedy, thinking off.  One-turn prompts one after another on slot 0 (each another
   conversation), a 3-turn English role play on slot 1.
 * **qB**: the same model in config B's chain (`ngram-mod,draft-dflash` 15/8, `--spec-draft-n-max 5`, probabilistic),
   `-c 65536`, at temperature 0 and 0.7 (seed 1).
-* **mA**: another family, Muse-Glimmer-30B-UD-Q5_K_M + z-lab's Muse-Glimmer-30B-DFlash2-Q4_K_M, `-c 32768`, as qA.
+* **mA**: another family, Muse-Glimmer-30B-UD-Q5_K_M + z-lab's Muse-Glimmer-30B-DFlash2-Q4_K_M, `-c 32768`, as qA but with
+  its chat template's defaults.
 * **gI**: granite-4.2-30b-Q5_K_M with `--spec-type ngram-mod` only (no DFlash2 draft): R and v5 must match.
 
 | qA (tokens) | R t/s | v5, first run | v5, re-run | v2 |
@@ -117,8 +118,8 @@ Ryzen 7 5700G, one R9700, Windows, TheRock ROCm 10.0.0, plain `v15-6050b467c-r17
 | geometric mean | | **+7.6 %** | **+8.2 %** | +3.7 % |
 
 The first run's second v5 start is left out: all but one request in it, including those that drafted exactly what the
-first v5 start drafted, ran 13-27 % slower than R, so something else held the GPU (it is a desktop machine).  The re-run (R, then v5) is
-the replacement.
+first v5 start drafted, ran 13-27 % slower than R, so something else held the GPU (it is a desktop machine).  The
+re-run (R, then v5) is the replacement.
 
 | qB (tokens) | R t/s | v5 (two starts) | v2 |
 |---|---|---|---|
