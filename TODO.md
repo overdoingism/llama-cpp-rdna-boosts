@@ -323,17 +323,33 @@ device mapping made the next `cuMemCreate`(HOST)/`cuMemMap` zero a *live* host-l
 * **Goal C** — the drafter ring is measured, not promoted (`O3-DRAFTER-RING.md` §7: default-on or not, one size or
   per-model, MTP-only or DFlash2).
 * **A `-sm tensor` window** — designed only (`A6-TENSOR-SPLIT-WINDOW.md`); hardware-blocked here.
-* **Goal B** — **B1/B2/B1(c) done (A9); B-A steps 1 and 2 BUILT AND GATED (A10, 2026-10-31); next = the policy
-  (step 3, expected ~1 point of hits) and B3 (the arena half at `-n 2000`).**  Branch `wip-kv-residency-b`
-  `b5d895c59`: `LLAMA_KV_REGION_POOL=<cells>` makes the attention KV a pinned host MIRROR (authoritative, so
-  `seq_rm`/`seq_cp`/defrag/state/park are unchanged code) plus a compact device pool of indexer-block pages with a
-  page table and an in-graph resolve (`GGML_OP_KV_POOL`), and a second id list for the QSA reader's K/V gather.
-  **Measured at 103k with MTP depth 4: pool 48.3 t/s = the sparse ceiling (sparse+resident 47.9), +54 % over B2's
-  spilled arm, at 204 MiB instead of 816 MiB; 89.7 % hit rate; fills ~0.05 ms/step.**  So the pool's job is done
-  and the residual -20 % against resident-dense is the SPARSE ARM's own cost — a page policy cannot recover more
-  than ~0.05 ms/step, and the next lever is the indexer/top-k cost.  Gates: text identical pool on/off (854
-  `43b30de151b9` at 51 475), pool verify 0 mismatches, prefill-logit 0.000000/100.000 %, park/ckpt/state gates
-  PASS, `FLASH_ATTN_QSA` 27/27, no GPU faults.  Full record: `wip/kv-residency/BA-POOL-DESIGN.md` §7.  Previous:  Campaign branch `wip-kv-residency-b` `c045bf866` (based on the shipped tip): B2 (`is_streaming` + `qwen4exp_kv_streams`) makes a windowed KV take the sparse decode arm (+34.3 % at 103k, +47.3 % at 180k; `LLAMA_QSA_DENSE_DECODE_STREAM=0` = A/B).  The census (`wip/kv-residency/qsa-census.py`) says the attended set is 2051 cells/layer/step, Jaccard 0.586, and a compact **page-table pool** (page = 4 cells = one indexer block, host-authoritative mirror, lag-1 admission, adaptive policy) hits **85-90 % with 0.05 ms/step of fills** at 8192 cells/layer = 107 MiB; the region's 4 MiB units (6 %, 90 ms/step) and a static ordering (63-68 %) are both refuted by measurement.  **Spec: `wip/kv-residency/BA-POOL-DESIGN.md`** (four gated steps).  Then B3 (the arena half at `-n 2000`), the MTP draft's sparse-decode re-measure under a streamed cache, and the promotion decision.  Nothing leaves `wip/` until then.
+* **Goal B** — **the pool is built, gated and measured; the policy is dead; the indexer item is fixed.  What is
+left is one stale measurement row and the three decisions below.**  Branch `wip-kv-residency-b` `b98cb3e43` (rebased
+onto r186; `wip-kv-residency-b-r182` keeps the pre-rebase tree).  `LLAMA_KV_REGION_POOL=<cells>` makes the attention
+KV a pinned host MIRROR (authoritative, so `seq_rm`/`seq_cp`/defrag/state/park are unchanged code) plus a compact
+device pool of indexer-block pages with a page table and an in-graph resolve (`GGML_OP_KV_POOL`), and a second id
+list for the QSA reader's K/V gather.  Acceptance at **5.3k / 103k / 180k** with `-n 512`, MTP depth 4, arms
+interleaved: dense **72.09 / 59.10 / 48.73**, sparse 71.58 / 54.70 / 42.93, **pool 71.27 / 54.65 / 43.09** — i.e.
+the pool lands ON the sparse ceiling at every depth and the remaining gap to a resident KV is the sparse arm's own
+cost (7-12 % at depth), **not** placement.  A rocprofv3 census says the pool's own machinery is 0.10-0.11 ms/token
+(with fills 0.03-0.05 ms/step), so the page policy (the design's step 3) is **measured dead**; and the sparse arm's
+real cost was two bugs, both now fixed and gated on the campaign branch: A12 (`f8e47e392`, r183's 2-D copy fallback
+made the indexer chain's per-step whole-cache F32 copy cost 5.20 ms/token — a **delivery regression**, block 10) and
+A13 (`b98cb3e43`, the fused `INDEXER_SCORE`/`INDEXER_FILL` path skipped every quantized indexer key cache — now
+q8_0 + the q4/q5 family, byte-identical to the chain on all eight key types, **plain decode 23.68 -> 17.73 ms/token
+and 29.3 -> 36.3 t/s** at 103k; block 11).  Records: `wip/kv-residency/BA-POOL-DESIGN.md` §7-§10,
+`COLD-START-PROMPT.md` (the next session's list).
+
+**Open for Goal B, in order:** (1) re-measure the **180k** row on the A12+A13 build (the only stale number);
+(2) the **delivery placement** of A12 (block 10) and A13 (block 11) — each owes a `WORKLOG` entry, a
+`patches/README.md` note and the release gates, and both need a re-base onto the current release (the tree moved to
+r188 while they were built); (3) the **promotion decision** for the pool itself (the maintainer's): a block in
+`patches/`, `ENVIRONMENT.md` §, the pool's VRAM in `--fit`'s arithmetic, a **grow-on-demand mirror** (today the whole
+`-c` is pinned at creation: 0.2 / 1.6 / 2.4 GiB at 16k / 131k / 196k), the release-flow gates, and a default-off
+call (it forces the sparse arm, so it is a fittability feature like block 15, not a speed one).  Two accepted
+limitations: k-quant indexer keys stay on the per-op chain (a 256-element superblock does not divide `idx_dim` =
+128), and the pool declines a `-sm tensor` split (one page table per device would need a per-device pool and a
+split-aware resolve) — the latter needs the maintainer's multi-GPU host.
 
 **Nothing from `wip/kv-residency/` is in `patches/` or `release.json`, and nothing may be applied from it
 without an explicit go-ahead.**  The slice-1/2 code is the record, not a candidate: sub-slice 2's *growth*
