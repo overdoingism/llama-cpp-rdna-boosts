@@ -308,6 +308,19 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   so **a coherence or perf claim about them must name a `q8_0` KV arm**, and multi-device arms are mandatory
   (the submitter tested one card).  `GREEDY-PURITY.md` §74, `benchmarks/2026-10-31-kv-rotation-decode.md`,
   `archive/work/kv-rotation-decode/`.  QSA's own combine passes the new `had_dst` as `nullptr` (block 11).
+- **A Q8_1 publish only pays where its consumer's node still exists, and the quant decides that (r188, block 10, PR
+  #259).**  The 1-token fused MoE gate/up+GLU kernel now also publishes the **shared-expert** lane's GLU output
+  as Q8_1 (keyed on the shared GLU node, counters in the lane after the routed ones, nested inside
+  `GGML_CUDA_MOE_GLU_Q8`'s arming so the host can never arm what the kernel does not do; kill switch
+  `GGML_CUDA_MOE_SHARED_GLU_Q8=0`), so the **shared** down `MUL_MAT` skips its `quantize_q8_1`: one launch per
+  layer, **+1.1 % tg128 / +0.8 % @4096** on gfx1201 and **+2.6 % / +2.3 %** on gfx1100, bit-identical (`--ub 1`
+  A/B `0.000000 / 100.000 %`).  **It is inert wherever `ffn_down_shexp` is Q8_0** — block 08's `shexp_down_gate`
+  epilogue already consumes the shared GLU + shared down there, which is every Unsloth **UD** quant we hold
+  (measured: 839 launches/token before *and* after on `UD-Q4_K_M`, no perf delta); it fires on a conventional
+  quant (LMStudio `Q4_K_M` with Q4_K/Q6_K shared tensors, `UD-IQ3_S` — and on gfx1100 `UD-IQ3_S` the upstream
+  shared-pair matcher declines the lane entirely).  So judge a claim about it with a **launch census** and name
+  the GGUF; a publish that extends an existing one owes `GREEDY-PURITY.md` §75's conditions.
+  `benchmarks/2026-10-31-shared-glu-q8.md`, `archive/work/shared-glu-q8/`.
 - **A DFlash draft reserve must measure its two graphs at their own widths (r162, issue #239).**  A
   DFlash/DFlash2 draft context alternates a KV-injection graph (target-feature rows, up to `n_ubatch`, on the
   main scheduler) and a noise-block decoder graph (at most `n_seq x block` tokens, on the alt scheduler).

@@ -46,7 +46,7 @@ only as a rough shape.
 | 07 | `0007-…-block-07-k-quant-boosts-mmvq-VDR-Q6_K-MM` | k-quant boosts (VDR, Q6_K MMQ, Q1_0, grid pad) | +879 / −137 | 9 |
 | 08 | `0008-…-block-08-fused-kernels-old-08-fusions-ol` | fused kernels + fused MoE (+ r132: the Q8_1 cache's view-offset keying and source-range guard; + r145: the rms_norm reduction-order selector — strided by default, `GGML_CUDA_RMS_NORM_VEC=1` opts into upstream #29720's float4 grouping; + r161: the dense arm's `!ids` assert no longer gates the routed fused gate arm — issue #241) | +5500 / −440 | 35 |
 | 09 | `0009-…-block-09-host-resident-MoE-iface-schedul` | host-resident MoE: iface, scheduler, cache, slab hooks (+ r120: the second draft scheduler's slot is per arch, DFlash2 fix; + r132: the split-state cache hit returns instead of copying; + r144: the traffic report's decode-band census + the `GGML_CUDA_GRAPH_TRACE` graph-call counters; + r149: the graph-cache key carries the subgraph's weight identity, so a split graph's per-layer subgraphs replay — TODO #107) | +15190 / −526 | 65 |
-| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section; + r174: the M-RoPE section power is computed once, PR #249; + r183: PR #256's three GDN decode folds, its shared-expert gate fold and the 2-D copy guard; + r186: the conv fusion's single-device gate is gone, so the fusion and the r183 folds now run on `-sm tensor`/`-sm layer` too) | +14341 / −5057 | 81 |
+| 10 | `0010-…-block-10-slab-fusion-dispatcher-async-in` | slab + fusion dispatcher + async input ring (infrastructure) (+ r132: its two gated-q8_1 launch arms take the same guard; graph_optimize selects its own device; + r139: the compute-buffer chunk follows a live slab, issue #214; + r158: the replay guard compares the live tensors in place with a source-packed store, the graph key is built once per call; + r159: the FA prefill staging arena gains a **KV-chunked ring** (`GGML_CUDA_FA_STAGE_CHUNK`) and an **eager allocation mode** (`GGML_CUDA_FA_STAGE_PREALLOC=2`), both opt-in; + r160: the reserve-reason note records that the M-RoPE term is a declared/reachable 2-D capability, not "any M-RoPE model" — see the block section; + r174: the M-RoPE section power is computed once, PR #249; + r183: PR #256's three GDN decode folds, its shared-expert gate fold and the 2-D copy guard; + r186: the conv fusion's single-device gate is gone, so the fusion and the r183 folds now run on `-sm tensor`/`-sm layer` too; + r187: PR #258's five quantized-KV decode folds; + r188: PR #259's shared-expert lane Q8_1 publish) | +14913 / −5064 | 83 |
 | 11 | `0011-…-block-11-qwen4exp-model-hyper-connection` | qwen4exp model/QSA/HC/lazy reader/indexer cache (+ r140/r141: the combine+norm fusion reads the pinned inject, reduces like the chain it replaces, and reaches merged-tensor GGUFs — issue #226; + r142: the separate-tensor mixer emits its inject GEMM beside the down GEMM, restoring the BF16 src1 reuse, +3.4 % prefill; + r148: the HC inject logit is the chain's 1/hc-**scaled** scatter logit in the fused mixer too, so the fused pair agrees with the model's own chain — issue #228) | +11976 / −433 | 46 |
 | 12 | `0012-…-block-12-campaign-remainder-CPU-wins-bac` | campaign remainder (+ r106: Meta `ALL_GATHER`, DFlash2 `-sm tensor`, slab narrow-2; + r111/r112: `--host-experts pool` drops the pinned master; FRAC 80 + O_DIRECT defaults; + r119: batched state restore; + r130: DFlash ingest tail, server prompt-cache residency; + r143: the expert cache drops a model's tables at `llama_model_free`; + r146: parking moves a mirroring indexer cache with the attention cache, issue #227; + r147: the host pool's fifth portability helper, issue #231; + r155: a restored context checkpoint is not saved again and dropped checkpoints' buffers are recycled, PR #236; + r162: a DFlash draft reserves its KV injection at `-ub` and its noise block at `n_seq × block`, not the lm_head over `n_ubatch`; + r163: the DFlash target writes its extracted layer inputs into F1's device store from inside the graph, so they are no longer graph outputs, and the host rows are reserved only when the host path runs — issue #240; + r173: a new prompt-cache state buffer is faulted in with huge pages, PR #248) | +5156 / −944 | 80 |
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +569 / −6 | 19 |
@@ -1904,6 +1904,43 @@ unfused one.  `test-backend-ops` SSM_CONV 60/60, CONCAT 183/183, CPY 251/251, 3/
 * **Do not re-add a device-count test to "restore purity".**  If a divergence is ever found again, gate it on
   the *config* that shows it with a witness, not on a device count that also disables the bit-identical
   `-sm layer` arms.
+
+#### r188 — the shared-expert lane's Q8_1 publish (PR #259)
+
+**What it is.**  The r175 GLU Q8_1 publish covers the **routed** lanes only: the 1-token fused MoE gate/up+GLU
+kernel (`mul_mat_vec_q_moe`) writes each routed expert's GLU row into the quantize cache, so the routed down
+`MUL_MAT_ID` skips its `quantize_q8_1`.  A model with a **shared expert** writes one more lane (the last
+`blockIdx.y`, into `fusion.shared_dst`) and the shared down `MUL_MAT` then ran its own quantize.  The shared
+lane now publishes too, into its own cache entry keyed on the **shared GLU node** (`fusion.shared_dst`, the
+key that down looks up), with its counters in the lane **after** the routed ones
+(`lane = gridDim.y - 1 = nchannels_dst`) and the same 32-lane `warp_reduce_max/sum` + `roundf` arithmetic and
+zeroed padding blocks as `quantize_q8_1`.  `GGML_CUDA_MOE_SHARED_GLU_Q8=0` is the kill switch; it is nested
+inside the routed arming block, so `GGML_CUDA_MOE_GLU_Q8=0` (and every condition that stands the routed
+publish down: not a 32-lane wave, not one token, `n_ff % QK8_1 != 0`, non-contiguous `dst`, the counter
+budget) stands both down.  That nesting is the invariant, not an accident — it is what guarantees the host
+arms exactly the predicate the kernel implements, so a cache entry cannot exist that nothing filled.
+
+**Reach is a quant property (the one fact that decides whether a claim about this is meaningful).**  Block
+08's `shexp_down_gate` fusion (`shexp_down_gated_q8_0`) already consumes the shared GLU + shared down when
+`ffn_down_shexp` is **Q8_0**, and every Unsloth **UD** quant keeps that tensor at Q8_0.  On those files the
+shared down node does not exist, so this publish is inert — measured **839 launches/token before and after**
+(`UD-Q4_K_M`), with `shexp_down_gated_q8_0` in the census.  It fires where the shared down is its own node
+(conventional quants: the LMStudio `Q4_K_M` with Q6_K shared tensors, `UD-IQ3_S`), which is the file class
+the submitter measured.  **Quote the GGUF with any number.**
+
+**Worth.**  One launch per layer: Qwen3.6-35B-A3B launches/token **748 -> 708** (gfx1201) and **688 -> 648**
+(gfx1100).  LMStudio `Q4_K_M`, 1 GPU, three interleaved rounds: gfx1201 tg128 **139.54 -> 141.10 (+1.1 %)**,
+@4096 **136.47 -> 137.53 (+0.8 %)**; gfx1100 (7900 XTX) tg128 **177.90 -> 182.56 (+2.6 %)**, @4096
+**178.16 -> 182.28 (+2.3 %)**.  Rule-5 `llama-batched-bench -npl 1,4,8`: +1.1 % at 1 slot, flat at 4/8 (a
+multi-token batch never publishes).
+
+**Gates.**  `gate-prefill-logits.sh --ab "GGML_CUDA_MOE_SHARED_GLU_Q8=0" --ub 1` **0.000000 / 100.000 %** (the
+published blocks are `quantize_q8_1`'s, bit for bit); default-ub prefill logits unchanged; greedy text
+byte-identical at 1 GPU, 2 GPU `-sm tensor` (both x8 pairs), 3 GPU `-sm tensor`, 3 GPU `-sm layer`, a
+`-ncmoe 20` arm and on gfx1100; MTP identical text **and** acceptance on a dense 27B in both split modes
+(inert) and on a firing MoE arm (35B-A3B `UD-Q4_K_M` with `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`);
+`test-backend-ops -o MUL_MAT_ID` 931/931; no GPU faults.  Rule: `GREEDY-PURITY.md` §75.  Numbers:
+`benchmarks/2026-10-31-shared-glu-q8.md`; record `archive/work/shared-glu-q8/README.md`.
 
 ## Block 11 — qwen4exp: model, hyper-connections, lazy reader, QSA/indexer
 

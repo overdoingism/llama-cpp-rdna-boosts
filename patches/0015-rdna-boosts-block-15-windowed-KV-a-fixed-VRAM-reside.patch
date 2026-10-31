@@ -1,4 +1,4 @@
-From b314ae56c0bd9b6504681b51285542db8dcc7cbb Mon Sep 17 00:00:00 2001
+From cb8953567af4cf12775ba1674b1e363cee309627 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Fri, 30 Oct 2026 11:56:35 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: windowed KV (a fixed-VRAM

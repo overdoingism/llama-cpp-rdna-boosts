@@ -1,5 +1,69 @@
 # WORKLOG - dated delivery records
 
+## 261031.006 (r188) -- PR #259 accepted: the shared-expert lane publishes its GLU output's Q8_1 (block 10 amended) -- one launch/layer, +1.1 % gfx1201 / +2.6 % gfx1100, bit-identical
+
+**Released as `v16-6050b467c-r188` (16 blocks; block 10 amended, blocks 11-15 re-cut unchanged).**  Canonical
+tip `0e42c6bc2`, tree `61a89235716a899753c74cacb427f49d31f25b39` (r187 was `9ee1862a6` / `7cd527bde`).
+`release.json` refreshed; `scripts/validate-set.sh` OK (16/16, 284 Windows-scanned files).
+
+**What shipped.**  `briansp2020`'s PR #259, one patch (+33/-6) cut against r184 and applied to the r187 tree
+with offsets only.  The r175 GLU Q8_1 publish covers the **routed** lanes of the 1-token fused MoE
+gate/up+GLU kernel; a model with a shared expert writes one more lane (`blockIdx.y == gridDim.y - 1`, into
+`fusion.shared_dst`) and that down `MUL_MAT` still ran its own `quantize_q8_1`.  The shared lane now publishes
+too: into its own cache entry keyed on the **shared GLU node** (the key the shared down looks up), counters in
+the lane after the routed ones (`lane = gridDim.y - 1 = nchannels_dst`, budget `(n_used+1) * n_ff/QK8_1 <=
+4096`), the same 32-lane reduction/rounding and the same zeroed padding blocks.  `GGML_CUDA_MOE_SHARED_GLU_Q8=0`
+is the kill switch and the term is **nested inside** `GGML_CUDA_MOE_GLU_Q8`'s arming block, which is the
+invariant that matters: the host can never arm an entry the kernel does not fill.
+
+**Fold.**  Block 10 owns all three files (`common.cuh`, `mmvq.cu`, `mmvq-moe.cu`), so the patch went in there
+(squashed into the commit with its author/date preserved), blocks 11-15 replayed on top; their trees and patch
+bodies are unchanged (only the `From <sha>` line differs, as every re-cut does).  The fold's tree is
+byte-identical to the measured arm (`61a8923…`), so no re-measurement was needed.  No code change was required.
+
+**Claims reproduced** (gfx1201 3x R9700 + gfx1100 1x 7900 XTX, ROCm 10.1.0, 1 GPU, both arms from the same
+build dir, `ROCBLAS_USE_HIPBLASLT=0`, 3 interleaved rounds, `llama-bench -fa 1 -p 0 -n 128 -d 0,4096 -r 10`;
+model Qwen3.6-35B-A3B LMStudio `Q4_K_M`, whose shared tensors are Q4_K/Q6_K):
+
+| | PR says | measured |
+|---|---|---|
+| launches/token (gfx1201) | 761 -> 721 | **748 -> 708** (exactly one per layer, 40) |
+| launches/token (gfx1100) | — | **688 -> 648** |
+| tg128, R9700 | 141.61 -> 143.42 (+1.3 %) | 139.54 -> **141.10 (+1.1 %)** |
+| @4096, R9700 | — | 136.47 -> **137.53 (+0.8 %)** |
+| tg128, 7900 XTX | 175.45 -> 179.93 (+2.6 %) | 177.90 -> **182.56 (+2.6 %)** |
+| @4096, 7900 XTX | 172.55 -> 175.96 (+2.0 %) | 178.16 -> **182.28 (+2.3 %)** |
+
+**The finding the submission could not see -- reach is a quant property.**  Block 08's `shexp_down_gate`
+epilogue (`shexp_down_gated_q8_0`) already consumes the shared GLU + shared down when `ffn_down_shexp` is
+**Q8_0**, and every Unsloth **UD** quant keeps its shared tensors at Q8_0: on `UD-Q4_K_M` the patch is
+**inert** (839 launches/token before *and* after, no perf delta, `shexp_down_gated_q8_0` in the census).  It
+fires on conventional quants (LMStudio `Q4_K_M`, `UD-IQ3_S`) -- the file class the submitter measured, which
+is why their numbers reproduce here and the UD files show nothing.  On gfx1100 the `UD-IQ3_S` arm cannot even
+reach it (the upstream shared-pair matcher declines the lane there, `sup=0`), so the gfx1100 arm was measured
+on the copied LMStudio file.
+
+**Purity (all bit-identical).**  `gate-prefill-logits.sh --ab "GGML_CUDA_MOE_SHARED_GLU_Q8=0" --ub 1`
+**0.000000 / 100.000 %** (base PPL 6.2078) -- the published blocks are `quantize_q8_1`'s, bit for bit; the
+default-ub gate **-0.000000 / 99.967 %** against a base recorded from the r187 build (the stored-logit floor);
+greedy text identical at 1 GPU (`782/92d0837f148d`), 2 GPU `-sm tensor` on (0,1) and (0,2)
+(`793/adf5c8f08334`), 3 GPU `-sm tensor` (`794/f03cb34fd6ad`), 3 GPU `-sm layer` (`782/92d0837f148d`), a
+`-ncmoe 20` arm (`786/d4e150984a25`) and gfx1100 (`831/56fb588a388f`); MTP identical text **and** acceptance on
+a dense 27B in both split modes (inert -- a verify batch is wider than one token: 0.60816 / 0.62134) and on a
+**firing** MoE arm (35B-A3B `UD-Q4_K_M` with `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`, `-n 2000`: `7061
+f80eab6cf390`, acceptance 0.72137 on both builds); `test-backend-ops -o MUL_MAT_ID` **931/931**; rule-5
+`llama-batched-bench -npl 1,4,8` +1.1 % at 1 slot and flat at 4/8; per-block build gate `--changed-from
+9ee1862a6 --fast` **2/2**; `check-gpu-faults.sh` clean.
+
+**Also recorded.**  `GREEDY-PURITY.md` §75 (a Q8_1 publish that extends an existing one must be armed by the
+predicate the kernel implements, keyed on the tensor the consumer looks up, in a disjoint counter lane, exactly
+`quantize_q8_1`'s write -- and its reach is a **quant** property, measured with a launch census and quoted with
+the GGUF); `ENVIRONMENT.md` §7.4 (`GGML_CUDA_MOE_SHARED_GLU_Q8`); `patches/README.md` block 10 (index row +
+"The shared-expert lane's Q8_1 publish (r188)"); `MANIFESTS.md` block-10 index + verification row;
+`AGENTS.md` critical facts; `benchmarks/2026-10-31-shared-glu-q8.md`; `archive/work/shared-glu-q8/` (the
+submitter's patch and README, with the gfx1100 round-3 caveat: that host was running a foreign CPU benchmark,
+so only the two clean rounds are quoted).
+
 ## 261031.005 (r187) -- PR #258 accepted: the quantized-KV decode rotations (block 10 amended, block 11 one line) -- +13.4 % / +10.1 % q8_0-KV decode, bit-identical
 
 **Released as `v16-6050b467c-r187` (16 blocks; block 10 amended).**  Canonical tip

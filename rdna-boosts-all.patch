@@ -12615,7 +12615,7 @@ index 101afeba2..8ad5e807d 100644
              ggml_cuda_swap(dst_row[col], dst_row[ixj]);
          }
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 6b36ca90b..9359bcf78 100644
+index 6b36ca90b..f3f096aff 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -40,6 +40,44 @@
@@ -14033,7 +14033,7 @@ index 6b36ca90b..9359bcf78 100644
  };
  struct ggml_cuda_mm_fusion_args_device {
      const void * x_bias = nullptr;
-@@ -1580,12 +2793,49 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -1580,12 +2793,53 @@ struct ggml_cuda_mm_fusion_args_device {
      const void * gate_bias = nullptr;
      const void * x_scale = nullptr;
      const void * gate_scale = nullptr;
@@ -14053,6 +14053,10 @@ index 6b36ca90b..9359bcf78 100644
 +    block_q8_1 * glu_q8 = nullptr;
 +    int * glu_q8_cnt = nullptr;
 +    uint32_t glu_q8_stride_channel = 0;
++    // the shared-expert lane's GLU output (shared_dst) as Q8_1 for the shared down projection (nullptr = off); its
++    // counters follow the routed lanes' (lane index = the number of routed lanes)
++    block_q8_1 * shared_glu_q8 = nullptr;
++    uint32_t shared_glu_q8_stride = 0;
 +    // MoE down (1 token) + weighted reduction: the last expert lane of a row block writes
 +    // red_dst[r] = sum_e (dst_e[r] * scale_e) * w_e in moe_weighted_reduction's order (red_dst = nullptr: off)
 +    float * red_dst = nullptr;
@@ -14083,7 +14087,7 @@ index 6b36ca90b..9359bcf78 100644
  };
  
  struct ggml_cuda_kernel_launch_params {
-@@ -1712,3 +2962,49 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
+@@ -1712,3 +2966,49 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
      kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
      CUDA_CHECK(cudaGetLastError());
  }
@@ -54698,10 +54702,10 @@ index 350b5cc06..dc4ca55d0 100644
      ggml_backend_cuda_context & ctx,
 diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
 new file mode 100644
-index 000000000..70513d479
+index 000000000..97f7992dc
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmvq-moe.cu
-@@ -0,0 +1,453 @@
+@@ -0,0 +1,457 @@
 +#include "mmvq-moe.cuh"
 +#include "mmvq-vecdot.cuh"
 +#include "mmvq.cuh"
@@ -54951,9 +54955,11 @@ index 000000000..70513d479
 +    // 32/rpb blocks, so each block adds its rows to the (slot, group) counter and the block that completes the group quantizes
 +    // it with one warp exactly as quantize_q8_1 does (same 32-lane reductions and rounding), then resets the counter.
 +    if constexpr (has_fusion) {
-+        if (warp_size == 32 && fusion.glu_q8 != nullptr && !shared_expert && use_gate) {
++        if (warp_size == 32 && use_gate && (shared_expert ? fusion.shared_glu_q8 != nullptr : fusion.glu_q8 != nullptr)) {
 +            const int g = row0 / QK8_1;
-+            int * cnt = fusion.glu_q8_cnt + channel_dst*(nrows_x/QK8_1) + g;
++            // the shared lane counts after the routed lanes (its channel_dst is 0, like the first routed lane's)
++            const uint32_t lane = shared_expert ? gridDim.y - 1 : channel_dst;
++            int * cnt = fusion.glu_q8_cnt + lane*(nrows_x/QK8_1) + g;
 +            __threadfence();
 +            int prev = 0;
 +            if (threadIdx.x == 0) {
@@ -54970,7 +54976,9 @@ index 000000000..70513d479
 +                    sum  = warp_reduce_sum<QK8_1>(sum);
 +                    const float  d = amax / 127.0f;
 +                    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
-+                    block_q8_1 * y = fusion.glu_q8 + channel_dst*fusion.glu_q8_stride_channel + g;
++                    block_q8_1 * ybase  = shared_expert ? fusion.shared_glu_q8 : fusion.glu_q8 + channel_dst*fusion.glu_q8_stride_channel;
++                    const uint32_t ystr = shared_expert ? fusion.shared_glu_q8_stride : fusion.glu_q8_stride_channel;
++                    block_q8_1 * y = ybase + g;
 +                    y->qs[threadIdx.x] = q;
 +                    if (threadIdx.x == 0) {
 +                        y->ds = make_half2(d, sum);
@@ -54979,9 +54987,9 @@ index 000000000..70513d479
 +                    // The row's padding blocks (its length padded to MATRIX_ROW_PADDING) are written as zeros, exactly as
 +                    // quantize_q8_1 writes them: the cache arena is reused across graphs, so a padded-row reader must not
 +                    // find stale blocks.  Only the block that completes the row's last group does it, and it owns the row.
-+                    if (g == (int) (nrows_x/QK8_1) - 1 && fusion.glu_q8_stride_channel > nrows_x/QK8_1) {
-+                        char * pad0 = (char *) (fusion.glu_q8 + channel_dst*fusion.glu_q8_stride_channel + nrows_x/QK8_1);
-+                        char * pad1 = (char *) (fusion.glu_q8 + (channel_dst + 1)*fusion.glu_q8_stride_channel);
++                    if (g == (int) (nrows_x/QK8_1) - 1 && ystr > nrows_x/QK8_1) {
++                        char * pad0 = (char *) (ybase + nrows_x/QK8_1);
++                        char * pad1 = (char *) (ybase + ystr);
 +                        for (char * p = pad0 + threadIdx.x; p < pad1; p += QK8_1) {
 +                            *p = 0;
 +                        }
@@ -55547,7 +55555,7 @@ index 000000000..b471e4949
 +    }
 +}
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 930f1adc4..30b1836fc 100644
+index 930f1adc4..d0a4d66a9 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,4 +1,6 @@
@@ -57335,7 +57343,7 @@ index 930f1adc4..30b1836fc 100644
          if (fusion->gate_scale) {
              GGML_ASSERT(fusion->gate_scale->type == GGML_TYPE_F32);
              GGML_ASSERT(ggml_is_contiguous(fusion->gate_scale));
-@@ -1535,10 +2120,57 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1535,10 +2120,76 @@ void ggml_cuda_mul_mat_vec_q(
          }
          fusion_local.glu_op = fusion->glu_op;
          fusion_local.glu_limit = fusion->glu_limit;
@@ -57355,6 +57363,25 @@ index 930f1adc4..30b1836fc 100644
 +                fusion_local.glu_q8_cnt = ctx.moe_glu_q8_counters();
 +                fusion_local.glu_q8_stride_channel = (uint32_t) (ne0_padded/QK8_1);
 +            }
++            // the shared-expert lane too (its counters after the routed lanes'): the shared down projection then skips
++            // its quantize_q8_1.  GGML_CUDA_MOE_SHARED_GLU_Q8=0: off.
++            static const bool shared_q8_on = getenv("GGML_CUDA_MOE_SHARED_GLU_Q8") == nullptr ||
++                                             atoi(getenv("GGML_CUDA_MOE_SHARED_GLU_Q8")) != 0;
++            const ggml_tensor * sd = fusion->shared_dst;
++            if (shared_q8_on && fusion->shared_up && sd != nullptr && sd->ne[0] == dst->ne[0] && sd->ne[1] == 1 &&
++                    sd->ne[2] == 1 && sd->ne[3] == 1 && ggml_is_contiguous(sd) &&
++                    (dst->ne[1] + 1)*(dst->ne[0]/QK8_1) <= GGML_CUDA_MOE_GLU_Q8_CNT) {
++                const size_t ts_sd = ggml_type_size(sd->type);
++                bool sfound = false;
++                void * sq8 = ctx.q8_1_cache_get(sd, ctx.curr_stream_no, ne0_padded/QK8_1*sizeof(block_q8_1),
++                                                sd->ne[0], sd->ne[1], sd->ne[2], sd->ne[3],
++                                                sd->nb[1]/ts_sd, sd->nb[2]/ts_sd, sd->nb[3]/ts_sd, sfound);
++                if (!sfound) {
++                    fusion_local.shared_glu_q8 = (block_q8_1 *) sq8;
++                    fusion_local.shared_glu_q8_stride = (uint32_t) (ne0_padded/QK8_1);
++                    fusion_local.glu_q8_cnt = ctx.moe_glu_q8_counters();
++                }
++            }
 +        }
 +        if (fusion->dst_gate) {
 +            GGML_ASSERT(fusion->dst_gate->type == GGML_TYPE_F32);
@@ -57369,10 +57396,8 @@ index 930f1adc4..30b1836fc 100644
 +            fusion_local.cat_row[k] = nrows_launch;
 +            nrows_launch += x->ne[1];
 +        }
-     }
- 
--    // If src0 is a temporary compute buffer, clear any potential padding.
--    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++    }
++
 +    // MoE down + weighted reduction fold, armed by ggml_cuda_mwr_fold_mark for this MUL_MAT_ID
 +    if (ids && ctx.mwr_fold_experts == dst && ggml_cuda_info().devices[ctx.device].warp_size == 32 &&
 +            fusion_local.gate == nullptr && fusion_local.shared_up == nullptr &&
@@ -57384,9 +57409,11 @@ index 930f1adc4..30b1836fc 100644
 +        fusion_local.red_cnt   = ctx.moe_red_counters();
 +        ctx.mwr_done_graph = ctx.mwr_fold_graph;
 +        ctx.mwr_done_idx   = ctx.mwr_fold_idx;
-+    }
+     }
 +    ctx.mwr_fold_experts = nullptr;
-+
+ 
+-    // If src0 is a temporary compute buffer, clear any potential padding.
+-    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
 +    // If src0 is a temporary compute buffer, clear any potential padding.  A redirected expert
 +    // table (wip/moe-expert-cache) carries no buffer; its compact arena has no padding to clear,
 +    // and `ggml_nbytes(src0)` would describe the full expert count, so the memset below would run
@@ -57395,7 +57422,7 @@ index 930f1adc4..30b1836fc 100644
          const size_t size_data  = ggml_nbytes(src0);
          const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
          if (size_alloc > size_data) {
-@@ -1549,12 +2181,27 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1549,12 +2200,27 @@ void ggml_cuda_mul_mat_vec_q(
      }
  
      const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -57429,7 +57456,7 @@ index 930f1adc4..30b1836fc 100644
      }
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1580,39 +2227,1446 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1580,39 +2246,1446 @@ void ggml_cuda_mul_mat_vec_q(
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  
      mul_mat_vec_q_switch_type(
