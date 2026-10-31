@@ -550,7 +550,7 @@ in the campaign:
 | **Goal A across a `-sm tensor` split** | **DESIGNED, not implemented** — [`A6-TENSOR-SPLIT-WINDOW.md`](A6-TENSOR-SPLIT-WINDOW.md): the five changes (Meta buft variant, grow fan-out, fit recognition, `region_capable`, fit sizing inside the split branch), the `common/fit.cpp` cross-check (four findings, `margins[0]` first) and the arms a 2/3-device host must run.  Still hardware-blocked here (one card) |
 | **`auto` policy** (the arena half) | **the maintainer's call, unchanged by r181.**  `auto` sizes the window to `free − margin − everything-but-the-KV`, where the margin includes the **arena/slab reserve**, so on a `-ncmoe` config the arena wins the VRAM and the window comes out small *by design*; and it only spills a pinned `-c`.  The measurement that decides it is `A2-MIXED-BACKING.md` §3.7.11.4 A–C.  `W` stays a cell count; a percentage-of-slab form is deferred — do not re-propose it |
 | **owed: a TEST gap in the delivery** | **FIXED (A6; committed as `e85c0164`)**  : `scripts/gate-park-idle-slots.sh` now counts actual park MOVES (it used to count the region refusal warning, logged under the same `seq_park` prefix) and, when the park arm logs *"cannot park the idle slot: saving it to the prompt cache and clearing it"*, reports *"parking declined -> save-and-clear fallback"* and still requires `park == lazyoff`, instead of failing on *"parking moved nothing"*.  Verified on a windowed Flash-Next arm (3 fallbacks -> PASS) and on the no-window control (6 park / 2 unpark moves -> PASS).  `A2-MIXED-BACKING.md` §3.7.13 |
-| **Goal B** — a sparse attended set (QSA/DSA) streamed instead of a full KV | **B1, B2, B1(c) DONE (A9); B-A STEPS 1+2 BUILT AND GATED (A10)** on branch `wip-kv-residency-b` (tip `b5d895c59`): `LLAMA_KV_REGION_POOL=<cells>` = pinned host mirror (authoritative) + compact device pool of indexer-block pages + page table + an in-graph resolve (`GGML_OP_KV_POOL`) with a second id list for the reader's K/V gather. Gates: text identical with the pool on vs off (854 `43b30de151b9` at 51 475 depth), the pool's verify kernel 0/0 mismatches, prefill-logit 0.000000/100.000 %, park/ckpt/state gates PASS, `FLASH_ATTN_QSA` 27/27, no GPU faults, **89.7 % hit rate at 4104 pages**.  And the headline: at 103k with MTP-4 the pool is **48.3 t/s = the sparse ceiling (sparse+resident 47.9)**, +54 % over B2's spilled arm, at **204 MiB instead of 816 MiB** — the residual -20 % against resident-dense is the SPARSE ARM's own cost, not placement.  **B3 is measured too**: at `-n 2000`, `-c 131072`, `-ncmoe 48`, the arena goes 23 579.8 -> 25 018.6 MiB (**+1.44 GiB**, +18 slots/table, expert hit 96.26 -> 97.02 %, cold reads 42.0 -> 31.6 GiB) for a 204 MiB pool instead of an 816 MiB KV; plain decode pays the sparse arm's -23 % (43.1 -> 33.0 t/s), and `identity fast path ON` is 0 in both arms (313/512 slots/table, so the r117 cliff is not in play).  `BA-POOL-DESIGN.md` §7.4-§7.5.  Previous:  Plan: [`B1-STRATA-PLAN.md`](B1-STRATA-PLAN.md) (§3.1-§3.6); pool spec: [`BA-POOL-DESIGN.md`](BA-POOL-DESIGN.md); census tool: [`qsa-census.py`](qsa-census.py).  **B1**: a *resident* KV wants DENSE decode, a *streamed* KV wants SPARSE (+34/47 % at 103k/180k).  **B2 (implemented, branch `wip-kv-residency-b`)**: `is_streaming(n_kv)` + `qwen4exp_kv_streams()` → +34.3 % at 103k, +47.3 % at 180k; `LLAMA_QSA_DENSE_DECODE_STREAM=0` is the A/B arm; text inert on a resident cache.  **B1(c)**: 2051 attended cells/layer/step, Jaccard 0.586; LRU pool 84.5 % @4096 cells/layer, 90.2 % @8192 (2.5 MiB/token vs 25.5 zero-hit); **adaptive beats a static ordering** (84-90 % vs 63-68 %); and block 15's region cannot express it (its 4 MiB unit = 3855 contiguous cells → **6 % hit, 90 ms/step** of flips).  **B-A = a compact pool + page table (page = 4 cells = one indexer block) + a host-authoritative mirror + an in-graph resolve, lag-1 admission, adaptive policy: 85-90 % hit, 0.05 ms/step of fills, 107 MiB for 12 layers.**  **Next = B-A step 1** (mirror + pool + page table as a KV cache mode; the design's build order).  Then B3 (arena half at `-n 2000`), the MTP draft's sparse-decode re-measure under a streamed cache, and the promotion decision  **A11 (2026-10-31) finished all three of those and reframed the campaign** (`BA-POOL-DESIGN.md` §8): the acceptance table is complete at **5.3k / 103k / 180k** with `-n 512` interleaved arms — dense **70.9 / 58.3 / 48.7** t/s, sparse 70.7 / 53.9 / 42.9, **pool 70.3 / 54.2 / 43.1** (i.e. the pool is ON the sparse ceiling everywhere, and the sparse penalty is **-0.4 / -7.5 / -11.9 %**, not -20 %: A10's `-n 128` window was measuring the two arms' *acceptance*, which differs 55 % vs 37 % in the first 128 tokens because they generate different text — §5 rule 9).  A rocprofv3 census attributes the sparse arm per verify step at 103k: indexer score chain **+6.7 ms**, radix top-k +0.9, **FA -5.8 (3.14 -> 1.09)**, pool resolve **+0.3**, copies +2.8, text/expert drift +3.4; plain decode shows the chain is *preparation* of the indexer keys (dequantizing key read 2.17 ms/token, whole-cache copy 1.83, bias 1.18, rope 1.08, rms 0.40) rather than the score matvec (0.28).  **So the pool's own machinery is 0.10-0.11 ms/token and its fills 0.03-0.05 ms/step: a page policy (step 3) is dead**, and the lever is the indexer score chain.  Step 3's other half also closed: `LLAMA_MTP_SPARSE_DECODE=1` under a pooled target is **-7.8 %** with identical text and acceptance, so its default-OFF stands |
+| **Goal B** — a sparse attended set (QSA/DSA) streamed instead of a full KV | **DELIVERY IS THE NEXT SESSION'S GOAL — the close-out plan is §12 (start there, not with the measurements below).**  `B1, B2, B1(c) DONE (A9); B-A STEPS 1+2 BUILT AND GATED (A10); A12/A13 fixed and gated (A12/A13 sessions)** on branch `wip-kv-residency-b` (tip `b5d895c59`): `LLAMA_KV_REGION_POOL=<cells>` = pinned host mirror (authoritative) + compact device pool of indexer-block pages + page table + an in-graph resolve (`GGML_OP_KV_POOL`) with a second id list for the reader's K/V gather. Gates: text identical with the pool on vs off (854 `43b30de151b9` at 51 475 depth), the pool's verify kernel 0/0 mismatches, prefill-logit 0.000000/100.000 %, park/ckpt/state gates PASS, `FLASH_ATTN_QSA` 27/27, no GPU faults, **89.7 % hit rate at 4104 pages**.  And the headline: at 103k with MTP-4 the pool is **48.3 t/s = the sparse ceiling (sparse+resident 47.9)**, +54 % over B2's spilled arm, at **204 MiB instead of 816 MiB** — the residual -20 % against resident-dense is the SPARSE ARM's own cost, not placement.  **B3 is measured too**: at `-n 2000`, `-c 131072`, `-ncmoe 48`, the arena goes 23 579.8 -> 25 018.6 MiB (**+1.44 GiB**, +18 slots/table, expert hit 96.26 -> 97.02 %, cold reads 42.0 -> 31.6 GiB) for a 204 MiB pool instead of an 816 MiB KV; plain decode pays the sparse arm's -23 % (43.1 -> 33.0 t/s), and `identity fast path ON` is 0 in both arms (313/512 slots/table, so the r117 cliff is not in play).  `BA-POOL-DESIGN.md` §7.4-§7.5.  Previous:  Plan: [`B1-STRATA-PLAN.md`](B1-STRATA-PLAN.md) (§3.1-§3.6); pool spec: [`BA-POOL-DESIGN.md`](BA-POOL-DESIGN.md); census tool: [`qsa-census.py`](qsa-census.py).  **B1**: a *resident* KV wants DENSE decode, a *streamed* KV wants SPARSE (+34/47 % at 103k/180k).  **B2 (implemented, branch `wip-kv-residency-b`)**: `is_streaming(n_kv)` + `qwen4exp_kv_streams()` → +34.3 % at 103k, +47.3 % at 180k; `LLAMA_QSA_DENSE_DECODE_STREAM=0` is the A/B arm; text inert on a resident cache.  **B1(c)**: 2051 attended cells/layer/step, Jaccard 0.586; LRU pool 84.5 % @4096 cells/layer, 90.2 % @8192 (2.5 MiB/token vs 25.5 zero-hit); **adaptive beats a static ordering** (84-90 % vs 63-68 %); and block 15's region cannot express it (its 4 MiB unit = 3855 contiguous cells → **6 % hit, 90 ms/step** of flips).  **B-A = a compact pool + page table (page = 4 cells = one indexer block) + a host-authoritative mirror + an in-graph resolve, lag-1 admission, adaptive policy: 85-90 % hit, 0.05 ms/step of fills, 107 MiB for 12 layers.**  **Next = B-A step 1** (mirror + pool + page table as a KV cache mode; the design's build order).  Then B3 (arena half at `-n 2000`), the MTP draft's sparse-decode re-measure under a streamed cache, and the promotion decision  **A11 (2026-10-31) finished all three of those and reframed the campaign** (`BA-POOL-DESIGN.md` §8): the acceptance table is complete at **5.3k / 103k / 180k** with `-n 512` interleaved arms — dense **70.9 / 58.3 / 48.7** t/s, sparse 70.7 / 53.9 / 42.9, **pool 70.3 / 54.2 / 43.1** (i.e. the pool is ON the sparse ceiling everywhere, and the sparse penalty is **-0.4 / -7.5 / -11.9 %**, not -20 %: A10's `-n 128` window was measuring the two arms' *acceptance*, which differs 55 % vs 37 % in the first 128 tokens because they generate different text — §5 rule 9).  A rocprofv3 census attributes the sparse arm per verify step at 103k: indexer score chain **+6.7 ms**, radix top-k +0.9, **FA -5.8 (3.14 -> 1.09)**, pool resolve **+0.3**, copies +2.8, text/expert drift +3.4; plain decode shows the chain is *preparation* of the indexer keys (dequantizing key read 2.17 ms/token, whole-cache copy 1.83, bias 1.18, rope 1.08, rms 0.40) rather than the score matvec (0.28).  **So the pool's own machinery is 0.10-0.11 ms/token and its fills 0.03-0.05 ms/step: a page policy (step 3) is dead**, and the lever is the indexer score chain.  Step 3's other half also closed: `LLAMA_MTP_SPARSE_DECODE=1` under a pooled target is **-7.8 %** with identical text and acceptance, so its default-OFF stands |
 | **Goal C** — the drafter ring (`LLAMA_SPEC_DRAFT_WINDOW`) | **measured, NOT promoted** (`O3-DRAFTER-RING.md`): free at a usable window (46k context, `W=32768`: acceptance −2.3 % rel, generation flat), 7-9 % lost far below the working context; the VRAM prize is one draft layer (~1 GiB at `-c 262144`) and it does not reach the arena (the draft KV lives in the slab's `aux_reserve`).  Three open questions in §7 |
 
 **A13 (2026-10-31) added — the indexer item is DONE:** the fused `INDEXER_SCORE` + derived `INDEXER_FILL` path
@@ -616,3 +616,105 @@ cannot stand in for attendance, and neither can the region's unit granularity.
    (pool off vs on), the pool arm's text equal to the resident **sparse** hash, `test-backend-ops -o
    FLASH_ATTN_QSA`, and `check-gpu-faults.sh` over every log.  Report findings to the maintainer before committing
    any delivery-affecting change, and **push the campaign branch after every step** (these arms can OOM this box).
+
+## 12. Goal B close-out plan — the next session's job (deliver it, don't re-measure it)
+
+**The maintainer's decision (2026-10-31): Goal B is to be finalised, wrapped up and DELIVERED into the delivery
+repo.**  Goal C and the two open Goal A items are carried forward, not dropped.  Report any finding to the
+maintainer before each delivery-affecting commit (AGENTS.md), but the *promotion itself is decided*: do not stop to
+re-ask whether to promote.
+
+Everything below assumes the rules in §5 (measurement) and §6 (gates) and the delivery flow in `AGENTS.md`
+("Pushing policy", "Common tasks → Regenerate the patches / Build the fork").  **Re-base first**: the campaign
+branch is on r186 and the delivery has moved on (r188 at the time of writing) — always re-base onto
+`release.json.tip`, never a hard-coded SHA.
+
+### 12.1 Order of work
+
+| # | task | done when |
+|---|---|---|
+| 0 | **Produce the last stale number**: the 180k acceptance row (`acceptance-arms.sh 180k`, one interleaved batch, `-n 512`, MTP 4) | §8.2's 180k row is measured on the final build |
+| 1 | **Re-base** the campaign branch onto the current `release.json.tip` (`git rebase --onto <new-tip> rebase-r186 wip-kv-residency-b`; keep the old tip as a `*-r<NNN>` branch, push both) | text + pool-verify + prefill-logit + the three state gates are green on the new base |
+| 2 | **Ship the two repairs first** (they are not campaign code): fold **A12** (block 10) and **A13** (block 11) into their owning blocks and cut the 16-patch set — *or* ship them as their own micro-release ahead of the pool (the maintainer's call; the micro-release is the lower-risk option and de-risks the pool) | `scripts/validate-set.sh` green, coherence + prefill-logit + the op tests green on the folded set |
+| 3 | **`--fit` accounting for the pool — the hard blocker** (see 12.2) | `llama-fit-params` reports the pool's 204 MiB and *not* the mirror's 1.6-2.4 GiB as VRAM, and a config that only fits with the pool is accepted |
+| 4 | **Decide grow-on-demand mirror** (12.3): implement, or ship it as a documented limitation | decision recorded in the block note + `TODO.md` |
+| 5 | **Package the pool as a block** (12.4): `patches/0016-*`, `release.json` via `scripts/make-release.sh`, `patches/README.md` block entry, `ENVIRONMENT.md` §, `MANIFESTS.md` apply order + verification contract, `AGENTS.md` naming (16 → 17 blocks), `WORKLOG.md` entry, `TODO.md` #118 closed to that entry | `validate-set.sh` + the tier-1 CI workflow green; the block's own gate list (12.5) recorded |
+| 6 | **Release it**: tag, `scripts/fork-refresh.sh --build --gates --push`, then the container watcher picks the tag up (never build the images on the primary box) | tag pushed, fork `rdna-boosts` tip == `release.json.tip`, images published by the worker |
+| 7 | **Refresh the campaign record**: re-export `wip/kv-residency/patches/goal-b/` from the final branch, update `SHA256SUMS`/`diffstate`, and shrink `COLD-START-PROMPT.md` to what is left (Goal C + the Goal A `auto` decision) | the patch series reproduces the branch tree; the prompt names only open work |
+
+### 12.2 The `--fit` blocker (task 3, in detail)
+
+`common/fit.cpp` recognises **only** the windowed-KV buffertype — `fit_buft_is_kv_region()` (line ~138) asks the
+backend for `ggml_backend_cuda_kv_region_is_kv_buft` and treats a match's `mb.context` bytes as "the KV cache's
+whole footprint at this `-c`, of which only the resident window is committed VRAM".  The **pool's mirror buft has
+no such predicate**, so with `LLAMA_KV_REGION_POOL` set its bytes are booked as ordinary **VRAM `mb.context`**:
+`--fit` reserves ~1.6 GiB (103k) / 2.4 GiB (180k) of VRAM for memory that is really pinned host RAM — it hands
+back exactly the arena the pool exists to free, and can refuse a fit that would work.
+
+What to do (mirror block 15's shape end to end):
+
+1. Backend: add `ggml_backend_cuda_kv_pool_is_kv_buft` beside the mirror-buft proc (`ggml-cuda.cu`, near
+   `ggml_backend_cuda_kv_pool_mirror_buft`) — true for the pool's mirror buft only.
+2. `common/fit.cpp`: extend `fit_buft_is_kv_region()` (or add a sibling) to accept either proc, and make the KV
+   bytes it carries out `min(mirror bytes, cells x cell bytes)` — i.e. what the *device pool* actually commits.
+   The pool size is `LLAMA_KV_REGION_POOL` cells x cell bytes; when the env is `auto` (if that is added) it is a
+   decision like block 15's.
+3. `llama-fit-params` must print both numbers (pool VRAM, mirror host RAM) — the host half is already bounded by
+   `llama_kv_region_spill_reserve()` at cache creation, so the RAM ceiling story is done; it is the VRAM side that
+   is blind.
+4. Arms: a config that only fits with the pool (Flash-Next `-c 262144` on this 32 GB card) must be *accepted* with
+   `LLAMA_KV_REGION_POOL` set and *refused* without it; and `--fit` must not reduce the arena reserve by the mirror.
+5. If this cannot be made to read correctly, **do not ship the pool** — ship task 2 alone and leave the pool in
+   `wip/` (the rollback criterion).
+
+### 12.3 Grow-on-demand mirror (task 4)
+
+Today the whole `-c` is pinned at creation (204 MiB / 1.6 GiB / 2.4 GiB at 16k / 131k / 196k; ~4.9 GiB at 262k).
+The design's own note calls a grow-on-demand mirror "the obvious next step".  Shipping it as a *documented
+limitation* is acceptable (block 15's spill is lazy for the same reason and it shipped with a `LLAMA_KV_SPILL_RAM_PCT`
+ceiling); implementing it means mirror mappings grow with the cache watermark exactly as the region's host half
+does (`llama_kv_cache`'s `grow_cells`/`grow_for` is the model).  Decide, record, and if deferred add it to
+`TODO.md` as an open follow-up rather than a comment.
+
+### 12.4 Packaging the pool as a block (task 5, the pieces)
+
+* **Number**: the set is 16 blocks (`00` + `01`-`15`), so the pool is **block 16** (`patches/0016-…`).  Note the
+  `beta/0016-copy-2d-vec16/` directory is a *beta apply-order* prefix, not this block number — rename it if that
+  reads badly after the fact.
+* **Block note** in `patches/README.md`: the mirror-is-authoritative writer rule, the three invariants
+  (mark-then-claim, distinct-block claims, no transient scratch in a captured graph), the declines (single stream,
+  non-MLA, no window active, uniform geometry, `-sm tensor`, k-quant indexer keys), and the numbers.
+* **`ENVIRONMENT.md` §**: `LLAMA_KV_REGION_POOL` (cells; unset/0 = off = byte-identical), `LLAMA_KV_POOL_VERIFY`
+  (the oracle; 0 mismatches expected), `LLAMA_KV_POOL_STATS` (**a path**, appended — never stderr on a text arm).
+* **`AGENTS.md`**: "16 blocks" → 17 in the naming paragraph, the V2.1 map gains **16 attendance pool**, and the
+  default-on policy note ("a fittability feature like block 15 → default OFF, env enables").
+* **`MANIFESTS.md`**: apply order 17 commits, the block's verification contract, and its gate rows.
+* **Default**: **off** (`LLAMA_KV_REGION_POOL` unset).  It is a fittability feature: on a config whose KV fits it
+  costs the sparse-vs-dense gap (7-12 % at depth), so it is opt-in like block 15 — state that plainly in the block
+  note so nobody "fixes" the default.
+* **`TODO.md` #118** closes to a single `WORKLOG.md` entry (Goal B delivered; Goal C + the `auto` policy remain, as
+  their own items).  Do **not** archive `wip/kv-residency/` while Goal C is still open — the campaign directory
+  stays, shrunk to the open work, and the archived copy happens when the last item closes.
+
+### 12.5 The gate list the block owes on the final base (§6 has the commands)
+
+Text identity on a **resident** arm (pool off vs on) and pool == the resident **sparse** hash, plus the deep
+reference at 51 475 depth (`854 43b30de151b9`); `LLAMA_KV_POOL_VERIFY=1` 0 mismatches; prefill-logit **on a
+spilling arm** and on the pool arm (`--ab "LLAMA_KV_REGION_POOL=…"`, 0.000000 / 100.000 %); `gate-park-idle-slots.sh`,
+`gate-ckpt-reuse.sh`, `gate-state-pipe.sh` (the mirror is meant to make these trivial — that is the writer rule);
+`test-backend-ops -o FLASH_ATTN_QSA`; `check-gpu-faults.sh` over every log; the OOM baseline with the knob unset;
+`check-windows-paths.sh` + `check-windows-portability.sh` (clean on the two files the block adds —
+`kv-pool.cu`/`kv-pool.cuh` already are); and the 180k row from task 0 as the release evidence.
+
+### 12.6 Carried forward (not this session's delivery, but do not lose them)
+
+* **Goal C, the drafter ring** (`O3-DRAFTER-RING.md`): measured, **not** promoted — free at a usable window (46k
+  context, `W=32768`: acceptance −2.3 % rel, generation flat), 7-9 % lost far below the working context; the VRAM
+  prize (one draft layer, ~1 GiB at `-c 262144`) does not reach the arena.  Three open questions for the maintainer
+  before any promotion: default-on or opt-in, one window size or per-model, MTP-only or DFlash2 too.
+* **Goal A `auto` policy** (`A2-MIXED-BACKING.md` §3.7.11.4 A-C): the arena-vs-window trade — the maintainer's call,
+  measured, no new work needed.
+* **Goal A across `-sm tensor`** (`A6-TENSOR-SPLIT-WINDOW.md`): designed only, hardware-blocked on this one-card box.
+* **The radix top-k** (2.03 ms/token plain decode, 0.9 ms/step under MTP): the largest sparse-arm item left after
+  A13; optional, needs its own campaign.
+* **k-quant indexer keys**: accepted limitation (a 256-element superblock does not divide `idx_dim` = 128).
