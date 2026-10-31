@@ -1,5 +1,57 @@
 # WORKLOG - dated delivery records
 
+## 261031.005 (r187) -- PR #258 accepted: the quantized-KV decode rotations (block 10 amended, block 11 one line) -- +13.4 % / +10.1 % q8_0-KV decode, bit-identical
+
+**Released as `v16-6050b467c-r187` (16 blocks; block 10 amended).**  Canonical tip
+`9ee1862a646f7cc9186566a0bb49f15424003d40`, tree `7cd527bde82bb0df5c2abd618f725c3e17c6b394` (r186 was
+`8f9dad0be` / `0bd26dbe`).  `release.json` refreshed; `scripts/validate-set.sh` OK.
+
+**What shipped.**  `bsp2020`'s PR #258, five patches (+1238) cut against r184 and applied to the r186 tree with
+offsets only.  With `-ctk/-ctv q8_0` `build_attn` rotates Q/K (after their ROPE), V (before the cache write) and
+the attention output (before its projection), which had turned off every decode fusion the delivery has for an
+f16 cache: **726 kernel launches per token against 510** on Qwen3-30B-A3B.  Five default-on terms restore them,
+each with its own kill switch -- `GGML_CUDA_QK_ROTATE_HADAMARD` (the `QK_ROTATE` pass takes Q's rotation and
+defers V's behind the Q chain, projections in front, 1-token graphs only), `GGML_CUDA_FUSE_V_FWHT` (the fused K
+kernel rotates the V row), `GGML_CUDA_FA_COMBINE_FWHT` (the combine kernel does the output rotation and publishes
+the projection's Q8_1), `GGML_CUDA_QK_PAIR_FWHT` (the pair, quantized form) and `GGML_CUDA_FUSE_ROPE_FWHT` (rope
++ rotation for models without Q/K norm -- **the one that runs in prefill too**).
+
+**Fold.**  Block **10** owns every changed file, so the five went in there (block 11 takes the one-line
+`flash_attn_combine_results<D>` call-site update in `fattn-qsa.cu`, the file block 11 creates).  Folded by
+applying the combined diff into block 10's commit (author/date preserved), replaying blocks 11-15, then amending
+block 11 -- the tree is byte-identical to the validated arm.  No block renumbering, no new block.
+
+**Claims reproduced** (gfx1201, 3x R9700, ROCm 10.1.0, 1 GPU, `ROCBLAS_USE_HIPBLASLT=0`, 3 interleaved rounds,
+both arms from the same build dir): launches/token **726 -> 510** (exactly the submitter's number);
+Qwen3-Coder-30B-A3B Q4_K_M q8_0 KV tg128 **141.24 -> 160.06 (+13.3 %)** and @4096 **127.33 -> 140.18
+(+10.1 %)** (the PR's R9700 table said +10.8 / +10.7); gpt-oss-20b MXFP4 q8_0 (its only no-Q/K-norm arm here)
+**148.99 -> 155.01 (+4.0 %)** / **143.20 -> 151.88 (+6.1 %)**; **F16 KV unchanged** (162.67 -> 163.10, 138.72 ->
+138.82), i.e. the submitter's -0.8 % F16 "code layout" observation does not reproduce.
+
+**Purity (all bit-identical).**  Greedy text stock-vs-fold on six arches (Qwen3-Coder-30B-A3B, gpt-oss-20b,
+Gemma4-12B, Ling-3.0-tiny, LFM2.5-8B-A1B, Qwen3.6-35B-A3B) at 1 GPU q8_0 KV, on **3-GPU `-sm tensor` and
+`-sm layer`** (two models) and on a `-ncmoe 16` host-expert arm; MTP four axes at `-n 3000` identical text
+**and acceptance to the last digit** (0.61351 / 0.83360 / 0.89815 / 0.99200); `gate-prefill-logits.sh`
+**0.000000 / 100.000 %** against the recorded bases for both f16 and q8_0 KV, the five-switch `--ab` at `--ub 1`
+reading the harness floor (99.990 %, which the off-vs-off control also reads) and the rope-only form's
+`--ab "GGML_CUDA_FUSE_ROPE_FWHT=0"` at the default ub **0.000000 / 99.990 %**; `test-logits-width-probe KV=q8_0`
+at `P=3584`/`P>=4096` 3-run stable and identical to the all-off reference, single device and 3-GPU tensor/layer
+(`width_purity=PASS`, worst maxdiff 0); `test-backend-ops -o ROPE,SET_ROWS,FLASH_ATTN_EXT` **7059/7059** both
+builds; `llama-batched-bench -npl 1,4,8` flat or better; per-block build gate `--changed-from 8f9dad0be --fast`
+**3/3**; no GPU faults.  The submission's own gaps -- multi-GPU/`-sm tensor`, the prefill-logit gate and the
+rope-only form's prefill arm -- are covered above.
+
+**Two nits, neither a defect** (left as submitted): 0002's V offset is computed by subtracting `data` pointers
+and 0003 replaces it with `view_offs` + an assert (the fold lands the final form); and the FA request is a
+file-scope `thread_local` where the context already carries `qk_pend_*`.
+
+**Also recorded.**  `GREEDY-PURITY.md` §74 (the rule: a fusion that exists for one cache-quantizer path must
+reproduce that quantizer's write exactly, the elided tensor must be single-use and non-overlapping, the Q8_1
+publish only on the path that fills it, and a deferring pass owes the reverse hazard check);
+`ENVIRONMENT.md` §7.4 (five variables + the q8_0-only scope); `patches/README.md` block 10 / block 11;
+`MANIFESTS.md` release gate 1 and the block-10 verification row; `benchmarks/2026-10-31-kv-rotation-decode.md`;
+`archive/work/kv-rotation-decode/README.md`; `TODO.md` #190 (the other KV quant types are not fused).
+
 ## 261031.004 (r186) -- PR #194 (`set-tensor-async-ring`) re-assessed on the r186 tree and CLOSED; no delivery change
 
 **No patch, no release, no `release.json` change** -- the delivery set stays at `v16-6050b467c-r186` (16

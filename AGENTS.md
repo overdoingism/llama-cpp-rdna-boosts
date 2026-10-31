@@ -292,6 +292,22 @@ stub alive to serve them, and treat a `wip/` path in an old record as a historic
   the draft's compute buffer exceeds the unmapped VA spare (a tensor-split drafter's is 1280 MiB against the
   estimator's 512 MiB tier; without it `-sm tensor` + draft + `-ncmoe` aborts in `graph_reserve`).  Rule:
   `patches/README.md` (block 12, "Facts that span blocks").
+- **A quantized KV cache rotates Q/K/V, and the decode fusions for it are r187's five (block 10, PR #258).**  With
+  `-ctk/-ctv q8_0` `build_attn` inserts a Hadamard rotation on Q/K (after their ROPE), on V (before the cache
+  write) and on the attention output (before its projection), which had switched **every** decode fusion off on
+  that arm: 726 kernel launches per token against 510 (Qwen3-30B-A3B).  `GGML_CUDA_QK_ROTATE_HADAMARD` (the
+  `QK_ROTATE` pass takes Q's rotation, defers V's behind the Q chain — 1-token graphs only, and it verifies no
+  node left in front reads a deferred one), `GGML_CUDA_FUSE_V_FWHT` (the fused K kernel rotates the V row with
+  `ggml_cuda_fwht_warp<64, 32>` + the q8_0 group quantize map), `GGML_CUDA_FA_COMBINE_FWHT` (the combine kernel
+  does the output rotation and publishes the projection's Q8_1 — **only** where the combine runs; otherwise the
+  rotation runs as before and no cache entry is created), `GGML_CUDA_QK_PAIR_FWHT` (the pair, quantized form) and
+  `GGML_CUDA_FUSE_ROPE_FWHT` (rope + rotation for models without Q/K norm — **the only one that runs in prefill
+  too**, so it carries the prefill-logit obligation; it fires on gpt-oss on our models, not on qwen/gemma).
+  All five key on the cache `SET_ROWS` being `GGML_TYPE_Q8_0` (other types keep their launches, `TODO` #190), and
+  they are worth **+13.4 % tg128 / +10.1 % @4096** on a 30B-A3B q8_0-KV arm (gfx1201) with **f16 KV unchanged** —
+  so **a coherence or perf claim about them must name a `q8_0` KV arm**, and multi-device arms are mandatory
+  (the submitter tested one card).  `GREEDY-PURITY.md` §74, `benchmarks/2026-10-31-kv-rotation-decode.md`,
+  `archive/work/kv-rotation-decode/`.  QSA's own combine passes the new `had_dst` as `nullptr` (block 11).
 - **A DFlash draft reserve must measure its two graphs at their own widths (r162, issue #239).**  A
   DFlash/DFlash2 draft context alternates a KV-injection graph (target-feature rows, up to `n_ubatch`, on the
   main scheduler) and a noise-block decoder graph (at most `n_seq x block` tokens, on the alt scheduler).

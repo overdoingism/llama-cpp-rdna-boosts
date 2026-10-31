@@ -1360,6 +1360,43 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
 * **The fusion dispatcher** (`ggml-cuda-try-fuse.cu`): the matcher arms moved out of `ggml-cuda.cu`.
 * **Rope/FWHT fusions** (M-RoPE and NEOX, with the q8_0 K/V cache `SET_ROWS` folded in), the paired GDN
   q/k norms, and the `ADD + rms_norm_q8_1` one-token fusion (`GREEDY-PURITY.md` §42).
+* **The quantized-KV decode fusions (r187, PR #258, `GREEDY-PURITY.md` §74).**  With `-ctk/-ctv q8_0`
+  `build_attn` rotates Q/K after their ROPE and V before the cache write, and for V the attention output
+  before the projection — which turned every fusion above off on that arm: 726 kernel launches per token
+  against 510 with an f16 cache (Qwen3-30B-A3B).  Five default-on terms put them back, all bit-identical and
+  each with its own kill switch:
+  * `GGML_CUDA_QK_ROTATE_HADAMARD` — the `GGML_CUDA_QK_ROTATE` pass also takes Q's rotation
+    (`RESHAPE`, Hadamard `MUL_MAT`, `RESHAPE`, so `q_end = i + 7`) and **defers V's rotation** (the Hadamards
+    between the chains, the `RESHAPE`/`VIEW`s they read and everything downstream of them) behind the Q chain,
+    leaving the projections in front.  1-token graphs only (prefill keeps the stock order), and the whole
+    rotate is skipped if a node left in front would read a deferred one.
+  * `GGML_CUDA_FUSE_V_FWHT` — the fused K kernel (norm+rope+FWHT+q8_0 K/V `SET_ROWS`) rotates the V row
+    itself with `ggml_cuda_fwht_warp<64, 32>` and the same lane->element quantize map, so the V FWHT launch
+    goes away.  Single-use rotated V, not a graph output, 32-lane wave, source disjoint from the cache rows.
+  * `GGML_CUDA_FA_COMBINE_FWHT` — at a 1-token FA whose **combine kernel** runs (`parallel_blocks > 1`) and
+    whose output feeds the 64-wide rotation + an mmvq projection, `flash_attn_combine_results<D, true>` stages
+    each row in shared memory, applies the same FWHT, stores it and publishes the projection's Q8_1 (the
+    `GGML_CUDA_FA_COMBINE_Q8` mechanism, so `GGML_CUDA_FA_Q8_1`-style cache accounting is unchanged).  If the
+    combine does not run the rotation runs as before and **no** cache entry is created; the plain `<D>`
+    instantiation is untouched.  This is the one term whose kernel lives in block 05's TU — it is an
+    extension of the combine-q8 code block 10 already owns (`fattn-common.cuh`), not a change to block 05's
+    arithmetic.
+  * `GGML_CUDA_QK_PAIR_FWHT` — `GGML_CUDA_ROPE_QK_PAIR`'s quantized form: Q's norm+rope+rotation is deferred
+    to the V-rotation + K site seven nodes later and both run as one `rms_norm_mul_rope_f32_qk_pair<..,
+    fwht_n, true>` launch (each block runs the single launch's body).  Q's rotation output is checked against
+    everything the K half reads and the K/V cache rows against everything the Q half reads; an orphaned Q
+    falls back to the single launch (with the FWHT when that is what was deferred).
+  * `GGML_CUDA_FUSE_ROPE_FWHT` — a ROPE with **no** norm in front (Llama-style) runs as one
+    `rms_norm_mul_rope_f32<.., no_norm = true>` launch, taking the K `RESHAPE`/`VIEW`/q8_0 `SET_ROWS` (and the
+    V row when allowed).  **Any token count, so prefill takes it too** — it is the only term of the five that
+    does, so it carries the prefill-logit obligation (`gate-prefill-logits.sh --ab
+    "GGML_CUDA_FUSE_ROPE_FWHT=0"`, plus the `--ub 1` arm).  Fires on gpt-oss on our models, not on
+    qwen/gemma (their ROPE follows a norm).
+  All five key on the cache `SET_ROWS` being **`GGML_TYPE_Q8_0`** (`TODO` #190 covers the other KV types).
+  Measured on gfx1201 1 GPU, Qwen3-30B-A3B Q4_K_M q8_0 KV: tg128 **141.2 -> 160.1 t/s (+13.4 %)**,
+  @4096 **127.3 -> 140.1 (+10.1 %)**, launches/token **726 -> 510**; F16 KV unchanged (162.7 vs 163.1);
+  gpt-oss-20b q8_0 **+4.0 % / +6.1 %**.  Records: `WORKLOG.md` 261031.005,
+  `benchmarks/2026-10-31-kv-rotation-decode.md`, `archive/work/kv-rotation-decode/`.
 * **bf16 RoPE destinations (r103, `TODO` #83, filed and closed in r103)**: `rope.cu` instantiated float/f16 destinations for the NORMAL
   and NEOX modes but not bf16, and since r101 the iSWA `k_cur`/`v_cur` reorder lets the ROPE → VIEW →
   SET_ROWS fusion fire for Gemma's K — so `-ctk bf16 -ctv bf16` prefill aborted at `rope.cu:672`.  The four
@@ -1878,10 +1915,13 @@ slab/dispatcher/ring code of its own beyond the arms implemented in its own TUs.
 
 **Contents.**
 
-* **The QSA combine launch passes the FA combine's new `q8` argument as `nullptr` (r175).**  Block 10's
-  FA-combine Q8_1 publish added a `block_q8_1 * q8` parameter to `flash_attn_combine_results`; QSA's own
-  combine (`fattn-qsa.cu`, created by this block) publishes nothing because its output is not fed to a
-  quantized matmul.  A new combine call site owes that decision explicitly.
+* **The QSA combine launch passes the FA combine's new `q8` argument as `nullptr` (r175), and its `had_dst`
+  as `nullptr` (r187).**  Block 10's FA-combine Q8_1 publish added a `block_q8_1 * q8` parameter to
+  `flash_attn_combine_results`; QSA's own combine (`fattn-qsa.cu`, created by this block) publishes nothing
+  because its output is not fed to a quantized matmul.  r187's rotation fold (block 10,
+  `GGML_CUDA_FA_COMBINE_FWHT`) added a trailing `float * had_dst` for the same reason — the apply has no
+  quantized-KV output rotation either — so this block's call site carries `(float *) nullptr` for it.  A new
+  combine call site owes both decisions explicitly.
 
 * **The HC down/inject pairs are one tensor (r138, upstream #31028).**  `create_merged(
   LLM_TENSOR_HC_{ATTN,FFN}_DOWN_INJECT, …)` accepts the converter's merged weight and `build_hc_mix(…,
