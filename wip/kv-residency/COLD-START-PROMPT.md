@@ -42,14 +42,14 @@ q8_0 KV, PLE flags, `ROCBLAS_USE_HIPBLASLT=0`, static MTP depth 4, **`-n 512`**,
 
 | depth (`-c`) | resident dense | resident sparse | **pool** (204.4 MiB) | tokens/step (dense / sparse) |
 |---|---|---|---|---|
-| 5 298 (`16384`) | **70.94** | 70.65 (−0.4 %) | **70.30** (−0.9 %) | 2.65 / 2.78 |
+| 5 298 (`16384`) | **72.09** | 71.58 (−0.7 %) | **71.27** (−1.1 %) | 2.65 / 2.78 |
 | 102 899 (`131072`) | **59.10** | 54.70 (−7.4 %) | **54.65** (−7.5 %) | 2.83 / 2.84 |
 | 180 035 (`196608`) | **48.73** | 42.93 (−11.9 %) | **43.09** (−11.6 %) | 2.75 / 2.71 |
 
 (The 103k row is **post-A12+A13**.  On the plain rebased tree it read 58.92 / 50.42 / 50.63 — that −14 % was a
-*delivery regression*, not the arm (§9.2).  The **5.3k and 180k rows predate A12/A13** and must be re-measured on
-the current build before they are quoted again; at 180k expect roughly +1.3 t/s from A12 and a few tenths from A13
-on the sparse/pool arms.)
+*delivery regression*, not the arm (§9.2).  The **5.3k row is post-A12/A13** (A11's ratios hold, everything ~1.4 %
+faster).  The **180k row still predates A12/A13** and must be re-measured before it is quoted; expect roughly
++1.3 t/s from A12 and a few tenths from A13 on its sparse/pool arms.)
 
 * **The pool lands ON the sparse ceiling at every depth** (+0.35…+0.6 % = noise): placement is free, and what
   remains is the sparse decode arm's own cost.  Prefill: neutral at 5.3k, −5 % (103k) / −8 % (180k) — the mirror
@@ -79,8 +79,8 @@ on the sparse/pool arms.)
 
 **THIS SESSION'S JOB, in order:**
 
-1. **Re-measure the two stale rows** on the current build (`acceptance-arms.sh 5k` and `180k`, one interleaved
-   batch each, `-n 512`, MTP-4) and update §8.2/§10.2.  Everything else in the table is current.
+1. **Re-measure the 180k row** on the current build (`acceptance-arms.sh 180k`, one interleaved batch, `-n 512`,
+   MTP-4) and update §8.2.  The 5.3k row is already done (72.09 / 71.58 / 71.27) and the 103k row is post-fix.
 2. **The delivery placement of the two fixes is the maintainer's call** (§10.3): A12's vectorised 2-D copy
    fallback repairs r183's guard regression and belongs in **block 10**; A13's quantized-key fused loader belongs
    in **block 11** (qwen4exp/QSA).  Each needs a `WORKLOG.md` entry, a `patches/README.md` note, and the release

@@ -263,9 +263,9 @@ bucket, with the call-count filter).
 
 | depth | arm | gen t/s | tokens/step | draft / accepted | prefill t/s |
 |---|---|---|---|---|---|
-| **5 298** (`16384`) | resident dense | **70.94** (71.11 / 70.77) | 2.65 | 766 / 319 (41.6 %) | 523-526 |
-| | resident sparse | **70.65** (70.67 / 70.63) | 2.78 | 728 / 328 (45.1 %) | 523-525 |
-| | pool (204 MiB) | **70.30** (70.31 / 70.29) | 2.78 | 728 / 328 | 520-522 |
+| **5 298** (`16384`) | resident dense | **72.09** (A11: 70.94) | 2.65 | 766 / 319 (41.6 %) | 525.8 |
+| | resident sparse | **71.58** (A11: 70.65) | 2.78 | 728 / 328 (45.1 %) | 524.5 |
+| | pool (204 MiB) | **71.27** (A11: 70.30) | 2.78 | 728 / 328 | 522.0 |
 | **102 899** (`131072`) | resident dense | **58.27** | 2.83 | 715 / 331 (46.3 %) | 518.3 |
 | | resident sparse | **53.92** (−7.5 %) | 2.84 | 715 / 332 (46.4 %) | 518.0 |
 | | pool (204 MiB, mirror 1.6 GiB) | **54.20** (−7.0 %) | 2.84 | 715 / 332 | 491.4 (−5.1 %) |
@@ -276,6 +276,9 @@ bucket, with the call-count filter).
 * **The pool lands on the sparse ceiling at every depth** (+0.5 % / +0.6 % / +0.35 % vs the forced-sparse arm —
   i.e. all noise), so the pool's *placement* is free and the remaining gap to a resident KV is the sparse decode
   arm's own cost (8.5).
+* The **5.3k row was re-measured after A12/A13** (`acceptance-arms.sh 5k`): the arms are ~1.4 % faster than the A11
+  numbers in parentheses and the *ratios* are unchanged (pool −1.1 % vs dense), with text byte-identical to A11's
+  (`296 91ef8940d66e` / `332 dd1981213373`) and 99.26 % pool hits.
 * **5.3k is the first depth where the pool is free** (the brief expected a −3.5 % streaming tax there; it is not
   there): a 16 416-cell pool is *the whole cache* at `-c 16384` (the KV is 204 MiB there, i.e. the same 204 MiB
   as the pool), so 99.25 % of ids hit and only the misses and the indexer touch the mirror; prefill is neutral
