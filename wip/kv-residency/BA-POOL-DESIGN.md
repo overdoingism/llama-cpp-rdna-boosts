@@ -3,8 +3,10 @@
 **Status: STEPS 1 AND 2 ARE BUILT AND GATED (session A10, §7), the ACCEPTANCE TABLE IS COMPLETE AT THREE DEPTHS
 and the sparse arm is attributed (session A11, §8), and the page policy (step 3 of §4) is measured dead (§8.4).**
 A12 (§9) rebased the branch onto r186, found and fixed a delivery regression the rebase exposed, and identified
-the indexer chain's root cause: with a quantized indexer key cache the fused/derived scorer is skipped entirely.
-What is left is the quantized-key fused path (§9.4) and the promotion decision (§8.6).  Every number is measured on this box
+the indexer chain's root cause (a quantized indexer key cache skipped the fused/derived scorer entirely); **A13
+(§10) fixed that too** — the fused scorer now serves q8_0 and the q4/q5 family byte-identically, worth **+24 %**
+plain decode at 103k.  What is left is a re-measure of the other two depths, the delivery placement of the A12/A13
+fixes, and the promotion decision (§8.6).  Every number is measured on this box
 (1 R9700).  Plan context:
 [`B1-STRATA-PLAN.md`](B1-STRATA-PLAN.md) §3.2-§3.5; instrument and trace: [`qsa-census.py`](qsa-census.py) over a
 48-step decode trace (Flash-Next IQ3, `-c 131072`, 102 912 cells, sparse arm, `GGML_CUDA_DISABLE_GRAPHS=1`).
@@ -516,3 +518,71 @@ Three conclusions:
 * **A13-2 (policy, only if A13-1 is rejected):** keep the *indexer* cache in bf16 while the attention KV stays
   q8_0.  Costs `O(depth)` VRAM — at 103k the keys-only indexer cache goes 158 MiB → 316 MiB — and needs the
   `-ctk` plumbing, `--fit` and the docs to know it is a separate type.
+
+## 10. A13 (2026-10-31) — the fused indexer scorer now accepts QUANTIZED keys (the item, done)
+
+§9.3 named the root cause: with a quantized indexer key cache the fused `INDEXER_SCORE` + derived `INDEXER_FILL`
+path (both default-on) was skipped, and the per-op chain re-materialised the whole indexer key cache in F32 every
+step.  A13 closes it for the block types whose 32-element block divides `idx_dim` (128): **q8_0 and the whole
+q4/q5 family plus iq4_nl** — i.e. every quantized `-ctk` except the k-quants.
+
+**Branch `wip-kv-residency-b` `b98cb3e43`.**  Five files:
+
+* `ggml/src/ggml-cuda/indexer-score.cu` — `indexer_score_ld_chan(row, c, nb0K, ktype)` replaces the
+  element-address loader; the pooling helper is row-addressed (a bit-identical address for the float types, where
+  `nb0K` is 4/2/2).  Quantized rows are addressed in `nb0K`-byte blocks and dequantized with **ggml's own**
+  `dequantize_q8_0/q4_0/q4_1/q5_0/q5_1/q4_nl`, i.e. the same values `get_rows` gives the chain — that is what keeps
+  the two paths byte-identical.  Two packings matter: q8_0 holds one element per byte, while the 4/5-bit types put
+  a byte's low nibble at channel `b` and its high nibble at `b + 16`.  `indexer_score_ktype()` maps the type to the
+  kernel code and is used by both `_supported` predicates and both impls' asserts.
+* `ggml/include/ggml.h` + `ggml/src/ggml.c` — `ggml_indexer_key_type_supported()`, one predicate for the two
+  constructors, the CUDA kernels and the memory layer; the ctors accept the widened set.
+* `src/models/qwen4exp.cpp` — `idx_key_float` → `idx_key_fused` (the predicate), so a quantized cache takes the
+  fused path; the stale "env-gated probe" comments now say default-on (`GGML_CUDA_QSA_INDEXER_SCORE=0` is the chain).
+* `src/llama-memory-hybrid-idx.cpp` — `pool_create` builds the derived pool for those types too.
+
+### 10.1 Gates (Flash-Next IQ3_XXS, 1 GPU, `-ncmoe 48`, PLE flags, `ROCBLAS_USE_HIPBLASLT=0`)
+
+The A/B is the **pre-change per-op chain**, `GGML_CUDA_QSA_INDEXER_SCORE=0` — a built-in arm, not a second build.
+
+| gate | result |
+|---|---|
+| text, 5.3k greedy, **every supported key type** (fused vs chain) | **identical on all 8**: q8_0 296 `91ef8940d66e` / sparse 332 `dd1981213373` (**== the pre-change build's hashes**), f16 333 `c42a586a6d13`, bf16 296 `91ef8940d66e`, q4_0 307 `097ff06194d6`, q4_1 307 `097ff06194d6`, q5_0 336 `bd82b7ed544c`, q5_1 296 `3205db133b1d`, iq4_nl 323 `d7aba1c58e0c` |
+| q8_0 with `GGML_CUDA_QSA_INDEXER_CACHE=0` (fused, **no** derived pool) | 296 `91ef8940d66e` — the same, so the raw-pooling branch is covered too |
+| text, 51 475 depth, pool arm | q8_0 **854 `43b30de151b9`** (== the pre-change hash); q4_0 841 `65097e7c8630`, fused == chain |
+| prefill-logit gate **`--ub 1`** (the decode graph; base arm = the chain) | **0.000000 KLD / 100.000 % top-p** |
+| prefill-logit gate, ctx 16384, against the A12 base | 0.000000 / 100.000 % |
+| `test-backend-ops -o FLASH_ATTN_QSA` | OK |
+| `check-gpu-faults.sh` over every log | clean |
+
+### 10.2 Worth (103k, arms interleaved)
+
+| | A12 (copy fix) | **A13 (fused path)** | bf16 fused (the proxy) |
+|---|---|---|---|
+| plain decode, decode GPU kernel time | 23.68 ms/token | **17.73** | 17.83 |
+| plain decode, wall (profiled) | 29.3 t/s | **36.3 (+24 %)** | 36.2 |
+| indexer bucket, plain decode | 5.31 ms/token | **2.01** | 2.01 |
+| MTP-4 `-n 512`, resident dense | 58.63 | 59.10 | 55.38 (2x KV bytes) |
+| MTP-4 `-n 512`, resident sparse | 54.26 | **54.70** | 50.40 |
+| MTP-4 `-n 512`, pool | 54.52 | **54.65** | 50.96 |
+
+* The log now says *"derived indexer cache (pool) = 12 layers x 128 dims x 1 streams, ENABLED"* for q8_0 (it said
+  *"skipped (q8_0 keys, derived cache enabled)"*).
+* **Plain decode gets the whole fused-path prize on the product KV type**: the dequantizing kernel lands exactly
+  where the bf16 arm did (17.73 vs 17.83 ms/token), so nothing is lost to the quantized load.
+* **MTP-4 barely moves (+0.8 %)** — as §9.3 predicted: the indexer is amortised over ~2.84 tokens/step there and
+  the MoE/expert traffic owns the token.  The campaign's MTP-shape row is therefore unchanged by A13; its 103k row
+  is now **59.10 / 54.70 / 54.65** (dense / sparse / pool, `-n 512`).
+* Compared with where A12 started on the rebased tree (58.92 / 50.42 / 50.63), the two sessions together are
+  **+0.3 % / +8.5 % / +7.9 %** on the three arms, and plain decode is 27.02 → 17.73 ms/token (**−34 %**).
+
+### 10.3 What is left
+
+1. **Re-measure the other two depths on this build** (5.3k and 180k, `-n 512`) — the 180k row predates A12 and A13.
+2. **Where A12 and A13 land in the delivery** (the maintainer's call): A12's `cpy_2d_vec16` repairs r183's guard
+   fallback (**block 10**), A13's quantized-key fused loader is qwen4exp/QSA code (**block 11**).  Both are
+   delivery fixes in their own right, independent of the pool's promotion.
+3. **k-quant indexer keys remain on the chain** (`q6_k` etc.): their 256-element superblock does not divide
+   `idx_dim` = 128, so a row is not a whole number of blocks and this loader cannot serve them.  A12's copy fix is
+   what keeps that path cheap.  Accepted limitation.
+4. Promotion of the pool is still the maintainer's decision (§8.6 item 4).

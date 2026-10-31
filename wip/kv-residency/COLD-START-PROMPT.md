@@ -1,8 +1,10 @@
 # Cold-session prompt — `wip/kv-residency` (TODO #118)
 
 Paste the block below into a fresh session.  It assumes only what is in the repo (nothing from the previous
-session's context).  **Rewritten 2026-10-31 at the end of session A12**: the branch is rebased onto r186, a
-delivery regression the rebase exposed is fixed, and the indexer chain's root cause is identified with a plan.
+session's context).  **Rewritten 2026-10-31 at the end of session A13**: the branch is rebased onto r186, the
+delivery regression the rebase exposed is fixed, and **the indexer item is done** — the fused scorer now serves
+quantized keys byte-identically, worth +24 % plain decode at 103k.  What is left is a re-measure of two depths and
+three decisions, all the maintainer's.
 
 ---
 
@@ -21,9 +23,11 @@ was built, every gate, the three defects), **§8** (A11: the acceptance table at
 census, the MTP-draft re-measure) and **§9** (A12: the rebase, the r183 copy regression and its fix, and the
 q8_0 fused-path gate) before touching anything.
 
-* Branch **`wip-kv-residency-b`**, tip **`f8e47e392`**, **rebased onto r186**: `rebase-r186` is the 16 blocks
+* Branch **`wip-kv-residency-b`**, tip **`b98cb3e43`**, **rebased onto r186**: `rebase-r186` is the 16 blocks
   re-cut from `patches/` at `release.json.base` (tip `8f9dad0be`, tree == `release.json`); the pre-rebase tip is
-  kept as branch **`wip-kv-residency-b-r182`** (`b5d895c59`).  Both pushed.
+  kept as branch **`wip-kv-residency-b-r182`** (`b5d895c59`).  Both pushed.  The tip carries, on top of the five
+  B-A commits, **two delivery fix candidates**: A12 `f8e47e392` (the r183 2-D copy fallback, **block 10**) and A13
+  `b98cb3e43` (the quantized-key fused indexer, **block 11**).
 * **`LLAMA_KV_REGION_POOL=<cells>`** (unset/`0` = off, byte-identical): the attention KV becomes a pinned host
   **MIRROR** (authoritative; every existing path runs on it unchanged) plus a compact **DEVICE POOL** of pages of
   one indexer block (4 cells), a page table `tbl[block] -> slot`, and **`GGML_OP_KV_POOL`** (mark / claim /
@@ -39,12 +43,13 @@ q8_0 KV, PLE flags, `ROCBLAS_USE_HIPBLASLT=0`, static MTP depth 4, **`-n 512`**,
 | depth (`-c`) | resident dense | resident sparse | **pool** (204.4 MiB) | tokens/step (dense / sparse) |
 |---|---|---|---|---|
 | 5 298 (`16384`) | **70.94** | 70.65 (−0.4 %) | **70.30** (−0.9 %) | 2.65 / 2.78 |
-| 102 899 (`131072`) | **58.63** | 54.26 (−7.0 %) | **54.52** (−7.0 %) | 2.83 / 2.84 |
+| 102 899 (`131072`) | **59.10** | 54.70 (−7.4 %) | **54.65** (−7.5 %) | 2.83 / 2.84 |
 | 180 035 (`196608`) | **48.73** | 42.93 (−11.9 %) | **43.09** (−11.6 %) | 2.75 / 2.71 |
 
-(The 103k row is **post-fix** — §9.2.1.  On the rebased tree before the fix it read 58.92 / 50.42 / 50.63, and
-that −14 % was a *delivery regression*, not the arm.  The 180k row is pre-fix and must be re-measured on the
-current build before it is quoted again; expect ~+1.3 t/s on its sparse/pool arms.)
+(The 103k row is **post-A12+A13**.  On the plain rebased tree it read 58.92 / 50.42 / 50.63 — that −14 % was a
+*delivery regression*, not the arm (§9.2).  The **5.3k and 180k rows predate A12/A13** and must be re-measured on
+the current build before they are quoted again; at 180k expect roughly +1.3 t/s from A12 and a few tenths from A13
+on the sparse/pool arms.)
 
 * **The pool lands ON the sparse ceiling at every depth** (+0.35…+0.6 % = noise): placement is free, and what
   remains is the sparse decode arm's own cost.  Prefill: neutral at 5.3k, −5 % (103k) / −8 % (180k) — the mirror
@@ -57,7 +62,14 @@ current build before it is quoted again; expect ~+1.3 t/s on its sparse/pool arm
   machinery is 0.10-0.11 ms/token and its fills 0.03-0.05 ms/step: the page policy (step 3) is dead.**
 * **Step 3's other half is closed:** `LLAMA_MTP_SPARSE_DECODE=1` under a pooled target is **−7.8 %** with
   identical text and acceptance, so that knob's default-OFF stands.
-* **A12 (§9): the chain's root cause is a quantization gate.**  With a **quantized indexer key cache**
+* **A13 (§10) closed the item.**  The fused `INDEXER_SCORE` + derived `INDEXER_FILL` path now accepts **quantized**
+  indexer keys (q8_0 and the q4/q5 family + iq4_nl; the k-quants cannot be served — a 256-element superblock does
+  not divide `idx_dim` = 128).  **Byte-identical to the per-op chain on all eight key types** (5.3k: q8_0 == the
+  pre-change hashes; 51 475-depth pool arm 854 `43b30de151b9`; prefill-logit `--ub 1` A/B 0.000000 / 100.000 %).
+  Worth at 103k: **plain decode 23.68 → 17.73 ms/token of kernels, 29.3 → 36.3 t/s (+24 %)** — exactly what the
+  bf16/fused proxy measured — while MTP-4 moves only 54.26 → 54.70 (the indexer is amortised over 2.84
+  tokens/step, and the MoE traffic owns the token).
+* **A12 (§9): the chain's root cause was a quantization gate.**  With a **quantized indexer key cache**
   (`-ctk q8_0`, the delivery's large-context type) the fused `INDEXER_SCORE` + derived `INDEXER_FILL` path is
   skipped wholesale (`idx_key_float` in `qwen4exp.cpp`; the log says *"derived indexer cache pool skipped (q8_0
   keys, derived cache enabled)"*) and the per-op chain re-materialises the whole indexer key cache in F32 every
@@ -65,37 +77,34 @@ current build before it is quoted again; expect ~+1.3 t/s on its sparse/pool arm
   kernels (**+23.5 %** wall, 29.3 → 36.2 t/s) and MTP-4 15.3 → 14.2 (flat on the wall: the 2× KV bytes cost the
   arena).  **So the item is "let the fused scorer read quantized keys", not "tune the chain".**
 
-**THIS SESSION'S JOB, in order (the maintainer has agreed with all of the above):**
+**THIS SESSION'S JOB, in order:**
 
-1. **Ship / re-home the A12 copy fix (a DELIVERY fix, not campaign code).**  `cpy_2d_vec16` in
-   `ggml/src/ggml-cuda/cpy.cu` (commit `f8e47e392` on the campaign branch) belongs in **block 10**, because it
-   repairs a regression r183 introduced for qwen4exp + quantized KV + the sparse arm — which block 15's windowed
-   KV takes by construction.  It is measured and bit-identical (§9.2.1); the maintainer's call is *where* it
-   lands (block-10 amendment + `WORKLOG` entry + `patches/README.md` note, or a separate micro-block).
-2. **A13-1: a quantized-key load path for `indexer_score_kernel` / `indexer_fill_kernel`** (§9.4) so the fused +
-   derived path serves `-ctk q8_0` — the delivery's own configuration and the campaign's.  Use the same
-   dequantize the chain's `get_rows` uses (`dequantize_q8_0`), keep `indexer-score.cu`'s **byte-toggle contract**
-   (a pool row must equal what the score pools from the raw cache), and note the derived fill's range leaf
-   advances only at `n_tokens == 1` (`llama-memory-hybrid-idx.cpp`), so an MTP verify batch fills nothing.
-   Gates: the `GGML_CUDA_QSA_INDEXER_CACHE=0` per-op chain's text vs the fused arm's (they must agree — that is
-   the toggle contract), prefill-logit `--ab "<env>" --ub 1` = 0.000000 / 100.000 %, `test-backend-ops -o
-   FLASH_ATTN_QSA`, and a census pair (expect the indexer bucket 5.31 → ~2.0 ms/token plain decode).
-3. **A13-2 (only if A13-1 is rejected): keep the *indexer* cache bf16 while the attention KV stays q8_0** — the
-   same fused path for `O(depth)` VRAM (keys-only: 158 → 316 MiB at 103k) plus `-ctk` plumbing, `--fit` and docs.
-4. **Then re-measure the 180k row (and 5.3k) on the final build**, and the promotion DECISION is the
-   maintainer's (§8.6 item 4: a block in `patches/`, `ENVIRONMENT.md` §, `patches/README.md`, the pool's VRAM in
-   `--fit`, a grow-on-demand mirror, the release-flow gates, default-off).
+1. **Re-measure the two stale rows** on the current build (`acceptance-arms.sh 5k` and `180k`, one interleaved
+   batch each, `-n 512`, MTP-4) and update §8.2/§10.2.  Everything else in the table is current.
+2. **The delivery placement of the two fixes is the maintainer's call** (§10.3): A12's vectorised 2-D copy
+   fallback repairs r183's guard regression and belongs in **block 10**; A13's quantized-key fused loader belongs
+   in **block 11** (qwen4exp/QSA).  Each needs a `WORKLOG.md` entry, a `patches/README.md` note, and the release
+   gates; both are independent of the pool's promotion.
+3. **The pool's promotion remains the maintainer's decision** (§8.6 item 4): a block in `patches/`,
+   `ENVIRONMENT.md` §, `patches/README.md` entry, the pool's VRAM in `--fit`'s arithmetic, a grow-on-demand mirror,
+   the release-flow gates, and a default-off call (it forces the sparse arm, so it is a fittability feature like
+   block 15, not a speed one).
+4. **Only if asked:** k-quant indexer keys (a 256-element superblock divided into `idx_dim` = 128 rows needs a
+   per-row-padded cache — a memory-format change, not a loader one), or the radix top-k (2.03 ms/token plain
+   decode, 0.9 ms/step under MTP — the second-biggest item left in the sparse arm).
 
 **Do not redo:** Goal A; B1/B2/B1(c); B-A's design, implementation or gates; the acceptance table's method or the
 census (§8); the "is the pool exact?" question; the page policy (dead); the MTP draft's sparse-decode re-measure
-(default-OFF holds); the rebase or the r183-regression hunt (§9.1-§9.2).
+(default-OFF holds); the rebase or the r183-regression hunt (§9.1-§9.2); the quantized-key fused loader (§10 — done
+and gated on all eight key types).
 
-START BY READING, in this order: [`BA-POOL-DESIGN.md`](BA-POOL-DESIGN.md) **§9** (where the work is), then §7-§8,
+START BY READING, in this order: [`BA-POOL-DESIGN.md`](BA-POOL-DESIGN.md) **§10** (A13, the item) and **§9** (A12,
+the rebase and the regression), then §7-§8,
 then `HANDOVER.md` (**§11 = the work list**, §3 the invariants, §5 the measurement rules — rule 9 is the
 `-n 512`/acceptance rule, §6 the gates), then `B1-STRATA-PLAN.md` §3.2-§3.6.
 
 STATE (verify, don't assume):
-  - **Campaign branch `wip-kv-residency-b`**, tip **`f8e47e392`** (rebased onto `rebase-r186` = `8f9dad0be`, the
+  - **Campaign branch `wip-kv-residency-b`**, tip **`b98cb3e43`** (rebased onto `rebase-r186` = `8f9dad0be`, the
     r186 delivery tree; pre-rebase tip kept as `wip-kv-residency-b-r182` = `b5d895c59`).  `wip-kv-residency`
     (`7c7769e50`) is Goal A's measurement tree — do not develop on it.  Never commit campaign code to
     `rdna-boosts`; **never touch `patches/` or `release.json`** without the maintainer's go-ahead.
