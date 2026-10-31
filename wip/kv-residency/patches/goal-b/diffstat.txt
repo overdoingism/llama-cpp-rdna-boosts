@@ -1,0 +1,23 @@
+ ggml/include/ggml-rpc.h             |   4 +-
+ ggml/include/ggml.h                 |  47 +++++
+ ggml/src/ggml-cpu/ggml-cpu.cpp      |   4 +
+ ggml/src/ggml-cuda/cpy.cu           |  38 +++-
+ ggml/src/ggml-cuda/fattn-qsa.cu     |  40 +++-
+ ggml/src/ggml-cuda/fattn-qsa3.cu    |   4 +
+ ggml/src/ggml-cuda/ggml-cuda.cu     | 133 ++++++++++++-
+ ggml/src/ggml-cuda/indexer-score.cu |  87 ++++++--
+ ggml/src/ggml-cuda/indexer-topk.cu  |  35 ++++
+ ggml/src/ggml-cuda/kv-pool.cu       | 353 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/kv-pool.cuh      |   7 +
+ ggml/src/ggml.c                     | 104 +++++++++-
+ src/llama-context.cpp               |   1 +
+ src/llama-kv-cache.cpp              | 383 +++++++++++++++++++++++++++++++++++-
+ src/llama-kv-cache.h                |  72 ++++++-
+ src/llama-memory-hybrid-idx.cpp     |  16 +-
+ src/llama-memory-hybrid-idx.h       |   4 +-
+ src/llama-memory-hybrid.cpp         |   8 +-
+ src/llama-memory-hybrid.h           |   4 +-
+ src/llama-memory.h                  |   5 +
+ src/llama-model.cpp                 |   3 +-
+ src/models/qwen4exp.cpp             |  77 ++++++--
+ 22 files changed, 1360 insertions(+), 69 deletions(-)
